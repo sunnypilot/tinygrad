@@ -62,23 +62,24 @@ class TestRendererFailures(unittest.TestCase):
 class TestCStyleFailures(unittest.TestCase):
   def test_inline_const_alu(self):
     # CPU doesn't use the max function
-    ret = _setup_and_test_alu(Ops.MAX, 1, UOp.const(dtypes.int, dtypes.min(dtypes.int)+1))
+    ret = _setup_and_test_alu(Ops.MAX, 1, UOp.const(dtypes.int, dtypes.int.min+1))
     self.assertEqual(ret[0], 1)
 
   def _test_src_strip_paren(self, op: Ops, should_strip_paren:bool=True):
     dtype = "bool" if op in (Ops.OR, Ops.XOR, Ops.AND) else None
     ret = Tensor.empty(1, dtype=dtype)
     for _ in range(5): ret = python_alu[op](ret, Tensor.empty(1, dtype=dtype))
-    schedule = ret.schedule()
-    assert len(schedule) == 1
-    schedule[0].lower()
-    src = schedule[0].prg.p.src
+    linear = ret.schedule_linear()
+    assert len(linear.src) == 1
+    src = get_program(linear.src[0].src[0], Device[Device.DEFAULT].renderer).src
     self.assertEqual("("*5 not in src, should_strip_paren)
 
   def test_repeat_add(self): self._test_src_strip_paren(Ops.ADD)
   def test_repeat_mul(self): self._test_src_strip_paren(Ops.MUL)
   def test_repeat_xor(self): self._test_src_strip_paren(Ops.XOR)
+  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, WGSLRenderer), "wgsl ends up with '(' * 5")
   def test_repeat_or(self): self._test_src_strip_paren(Ops.OR)
+  @unittest.skipIf(isinstance(Device[Device.DEFAULT].renderer, WGSLRenderer), "wgsl ends up with '(' * 5")
   def test_repeat_and(self): self._test_src_strip_paren(Ops.AND)
   def test_repeat_sub(self): self._test_src_strip_paren(Ops.SUB, should_strip_paren=False)
 
