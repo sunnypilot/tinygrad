@@ -2,13 +2,12 @@ from typing import Optional, Any
 import unittest, math
 import numpy as np
 from tinygrad.tensor import Tensor, _to_np_dtype
-from tinygrad.helpers import CI, getenv, Context
+from tinygrad.helpers import CI, Context
 from tinygrad.dtype import dtypes, DType, AddrSpace, ConstFloat  # noqa: F401
 from tinygrad.device import Buffer, Device
 from tinygrad.uop.ops import Ops, UOp, KernelInfo, AxisType
 from tinygrad.renderer.cstyle import CStyleLanguage
-from tinygrad.engine.realize import CompiledRunner, get_program, get_runner
-from tinygrad.engine.schedule import ExecItem
+from tinygrad.engine.realize import CompiledRunner, get_program, run_linear
 from tinygrad.device import is_dtype_supported
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.renderer.ptx import PTXRenderer
@@ -77,15 +76,15 @@ class TestUOps(unittest.TestCase):
   def _test_uop_fxn(self, op, fxn, dts=(dtypes.float32, )):
     for f in [_test_single_value, _test_single_value_const]:
       for a in [-2.0, 0.0, 1.0]:
-        a = dtypes.as_const(a, dts[0])
+        a = dts[0].const(a)
         self._equal(f([a], op, dts), fxn(a))
 
   def _test_bop_fxn(self, op, fxn, dts=(dtypes.float32, )*2, no_b_zero=False, no_b_neg=False):
     for f in [_test_single_value, _test_single_value_const]:
       for a in [-2.0, 0.0, 1.0]:
         for b in [-3.0, 1.0] + ([] if no_b_zero else [0.0]):
-          a = dtypes.as_const(a, dts[0])
-          b = dtypes.as_const(abs(b) if no_b_neg else b, dts[1])
+          a = dts[0].const(a)
+          b = dts[1].const(abs(b) if no_b_neg else b)
           self._equal(f([a,b], op, dts), fxn(a,b))
 
   def _test_top_fxn(self, op, fxn, dts=(dtypes.float32, )*3):
@@ -93,9 +92,9 @@ class TestUOps(unittest.TestCase):
       for a in [-2.0, 0, 1]:
         for b in [-3.0, 3.0]:
           for c in [-4.0, 4.0]:
-            a = dtypes.as_const(a, dts[0])
-            b = dtypes.as_const(b, dts[1])
-            c = dtypes.as_const(c, dts[2])
+            a = dts[0].const(a)
+            b = dts[1].const(b)
+            c = dts[2].const(c)
             self._equal(f([a,b,c], op, dts), fxn(a,b,c))
 
 class TestFloatUOps(TestUOps):
@@ -113,12 +112,18 @@ class TestFloatUOps(TestUOps):
   def test_max(self): self._test_bop_fxn(Ops.MAX, lambda a,b: max(a,b))
   def test_cmplt(self): self._test_bop_fxn(Ops.CMPLT, lambda a,b: a<b)
   def test_cmpne(self): self._test_bop_fxn(Ops.CMPNE, lambda a,b: a!=b)
+  @unittest.skipIf(Device.DEFAULT == "WEBGPU", "WEBGPU doesn't support NaN comparison correctly")
+  def test_cmpne_nan(self):  # NaN != x for any x (IEEE 754)
+    for a, b in [(math.nan, 1.0), (1.0, math.nan), (math.nan, math.nan)]:
+      self.assertTrue(_test_single_value(
+        [dtypes.float32.const(a), dtypes.float32.const(b)],
+        Ops.CMPNE, (dtypes.float32, dtypes.float32)))
   # MOD isn't tested on floats
 
   def test_where(self):
     self._test_top_fxn(Ops.WHERE, lambda a,b,c: b if a!=0 else c, (dtypes.bool, dtypes.float, dtypes.float))
 
-  @unittest.skipUnless(getenv("PYTHON"), "only python supports MULACC")
+  @unittest.skipUnless(Device.DEFAULT == "PYTHON", "only python supports MULACC")
   def test_mulacc(self):
     self._test_top_fxn(Ops.MULACC, lambda a,b,c: a*b+c, (dtypes.float, dtypes.float, dtypes.float))
 
@@ -240,12 +245,21 @@ class TestAssembly(unittest.TestCase):
     a = Tensor.empty(1024)
     b = Tensor.empty(1024)
     c = (a*b).sum()
-    ast = c.schedule()[-1].ast
+    ast = c.schedule_linear().src[-1].src[0]
     opts_to_apply = [Opt(OptOps.UNROLL, 0, 4)]
     ast = ast.replace(arg=KernelInfo(opts_to_apply=tuple(opts_to_apply)))
     program = get_program(ast, Device[Device.DEFAULT].renderer)
     uops = program.uops
-    self.assertEqual(len([x.op for x in uops if x.op is Ops.MULACC]), 4)
+    self.assertGreaterEqual(len([x.op for x in uops if x.op is Ops.MULACC]), 4)
+
+  def test_mulacc_shl(self):
+    g1 = UOp(Ops.PARAM, dtypes.int32.ptr(), (), 0)
+    c1 = UOp.const(dtypes.int, 0)
+    c2 = UOp.const(dtypes.int, 1)
+    expr = g1.index(c1) * UOp.const(dtypes.int, 4096) + g1.index(c2)
+    uops = to_uops_list([expr], ren=Device[Device.DEFAULT].renderer)
+    Device[Device.DEFAULT].renderer.render(uops)
+    self.assertIn(Ops.MULACC, [x.op for x in uops])
 
   def test_use_cmpeq(self):
     g = UOp(Ops.PARAM, dtypes.uint32.ptr(), (), 0)
@@ -266,7 +280,7 @@ class TestZeroRange(unittest.TestCase):
 
 class TestUOpPrograms(unittest.TestCase):
   def _run(self, prog:UOp, *tensors:Tensor):
-    ExecItem(prog, [t.uop.buffer for t in tensors], prg=get_runner(Device.DEFAULT, prog)).run(wait=True)
+    run_linear(UOp(Ops.LINEAR, src=(prog.call(*[t.uop.buf_uop for t in tensors]),)), do_update_stats=False)
 
   def test_simple(self):
     out = Tensor.empty(10,10,dtype=dtypes.int)

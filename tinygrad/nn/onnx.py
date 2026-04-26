@@ -2,7 +2,8 @@
 from typing import Any, Sequence, cast, Literal, NamedTuple, Generator
 import dataclasses, functools, io, math, types, warnings, pathlib, sys, os, struct, enum
 from tinygrad.nn.state import TensorIO
-from tinygrad.tensor import Tensor, _broadcast_shape, ReductionStr
+from tinygrad.tensor import Tensor, _broadcast_shape
+from tinygrad.mixin import ReductionStr
 from tinygrad.helpers import getenv, all_same, prod, flatten, make_tuple, argsort, is_numpy_ndarray, get_single_element, polyN
 from tinygrad.dtype import DType, ConstType, dtypes, _from_np_dtype, truncate, least_upper_dtype, DTYPES_DICT
 from tinygrad.device import is_dtype_supported, Device
@@ -511,7 +512,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     o_ = [((i - 1) // s + 1) for i,s in zip(i_, s_)]
     return _onnx_pads_to_tiny_pads(_auto_pad([(o-1)*s+k-i for o,i,k,s in zip(o_, i_, k_, s_)], auto_pad))
 
-  def _clamp_cast(x:Tensor, dtype:DType): return x.clamp(dtypes.min(dtype), dtypes.max(dtype)).cast(dtype)
+  def _clamp_cast(x:Tensor, dtype:DType): return x.clamp(dtype.min, dtype.max).cast(dtype)
 
   def _prepare_quantize(x:Tensor, scale:Tensor, zero_point:Tensor|int, axis=1, block_size=0):
     if axis < 0: axis += x.ndim
@@ -1170,7 +1171,6 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
     return ret.reshape(*x_shape[:batch_dims], *i_shape[batch_dims:-1], *ret.shape[indices.ndim-1:])
   def ScatterND(x:Tensor, indices:Tensor, updates:Tensor, reduction:Literal["none", "add", "mul", "max", "min"]='none'):
     assert updates.shape == indices.shape[:-1] + x.shape[cast(int, indices.shape[-1]):]
-    x = x.contiguous()
     for index, u in zip(indices.split(1, 0), updates.split(1, 0)):
       i = tuple(idx.squeeze(-1) for idx in index.squeeze(0).split(1, -1))
       u = u.squeeze(0)
@@ -1224,7 +1224,7 @@ def get_onnx_ops() -> dict[str, types.FunctionType|dict[OpSetId, types.FunctionT
 
   def DynamicQuantizeLinear(x: Tensor):
     # only support uint8
-    qmin, qmax = dtypes.min(dtypes.uint8), dtypes.max(dtypes.uint8)
+    qmin, qmax = dtypes.uint8.min, dtypes.uint8.max
     scale = (x.max().maximum(0) + ((-x).max()).maximum(0)) / (qmax - qmin)
     zero_point = _clamp_cast((qmin - x.min() / scale).round(), dtypes.uint8)
     y = _clamp_cast((x / scale).round() + zero_point, dtypes.uint8)

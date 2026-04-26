@@ -51,10 +51,20 @@ def do_expand(root:UOp):
         new_srcs.append(src)
       elif src.dtype.count > 1:
         # put any input dtype > 1 grouped together
-        new_srcs.append(UOp(Ops.CAT, src.dtype.scalar().vec(expand_sz*src.dtype.count), (src,)*expand_sz))
+        new_srcs.append(UOp(Ops.VCAT, src.dtype.scalar().vec(expand_sz*src.dtype.count), (src,)*expand_sz))
       else:
         # repeat the arg
         new_srcs.append(src.broadcast(expand_sz))
+
+  # for non-PtrDType INDEX on REG buffers, expand into individual scalar INDEXes instead of one vectorized INDEX
+  # this avoids creating a VECTORIZE of REG pointers which the devectorizer can't resolve
+  if root.op is Ops.INDEX and not isinstance(root.dtype, PtrDType) and \
+     isinstance(root.src[0].dtype, PtrDType) and root.src[0].dtype.addrspace == AddrSpace.REG:
+    idxs = []
+    for j in range(expand_sz):
+      idx_srcs = tuple(s.gep(j) if isinstance(s.dtype, PtrDType) or s.dtype.count > 1 else s for s in new_srcs)
+      idxs.append(UOp(Ops.INDEX, root.dtype, idx_srcs, root.arg))
+    return UOp(Ops.UNROLL, root.dtype, (UOp(Ops.STACK, root.dtype.vec(expand_sz), tuple(idxs)),), expand_args)
 
   new_arg = root.arg
   if root.op is Ops.GEP:
@@ -67,7 +77,7 @@ def do_expand(root:UOp):
 def do_contract(con:UOp):
   ex = con.src[0]
   # CONTRACT without UNROLL repeats the element VECTORIZED
-  if ex.op is not Ops.UNROLL: return UOp(Ops.VECTORIZE, con.dtype, con.src*con.dtype.count)
+  if ex.op is not Ops.UNROLL: return UOp(Ops.STACK, con.dtype, con.src*con.dtype.count)
   # CONTRACT may remove several axes from UNROLL
   assert con.dtype == dtypes.void or con.dtype.count == prod([x[1] for x in con.arg]), "dtype is wrong"
   idxs = []
@@ -95,7 +105,7 @@ expander = PatternMatcher([
    lambda outer, inner: UOp(Ops.UNROLL, outer.dtype, (inner.src[0],), inner.arg+outer.arg)),
   # do expansion
   (UPat((*GroupOp.ALU, Ops.CAST, Ops.BITCAST, Ops.GEP, Ops.WMMA, Ops.LOAD, Ops.STORE, Ops.INDEX, Ops.BUFFERIZE,
-         Ops.VECTORIZE, Ops.REDUCE, Ops.END, Ops.AFTER), name="root", custom_early_reject=set([Ops.UNROLL])), do_expand),
+         Ops.STACK, Ops.REDUCE, Ops.END, Ops.AFTER), name="root", custom_early_reject=set([Ops.UNROLL])), do_expand),
   (UPat(Ops.CONTRACT, name="con"), do_contract),
   # empty UNROLL is NOOP
   (UPat(Ops.UNROLL, src=(UPat.var('x'),), arg=()), lambda x: x),
