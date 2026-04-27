@@ -1,13 +1,13 @@
 import unittest
 import numpy as np
 from tinygrad import Tensor, GlobalCounters, dtypes, nn, Device, Variable
-from tinygrad.helpers import Context, getenv, EMULATE
+from tinygrad.helpers import Context, getenv, DEV
 from tinygrad.engine.realize import run_schedule
 from tinygrad.engine.realize import CompiledRunner, get_program
-from tinygrad.engine.schedule import ExecItem
-from tinygrad.uop.ops import Ops
+from tinygrad.schedule import ExecItem
 from tinygrad.renderer import Estimates
 from tinygrad.renderer.ptx import PTXRenderer
+from test.helpers import needs_second_gpu
 
 class TestArange(unittest.TestCase):
   def _get_flops(self, tensor, desired):
@@ -22,6 +22,10 @@ class TestArange(unittest.TestCase):
   def test_arange_complexity(self):
     self.assertEqual(self._get_flops(Tensor.arange(256), np.arange(256)), 0)
     self.assertEqual(self._get_flops(Tensor.arange(2560), np.arange(2560)), 0)
+
+  @unittest.skipIf(Device.DEFAULT == "CL", "TODO: fails on CI CL")
+  def test_arange_cumsum(self):
+    np.testing.assert_equal(Tensor.arange(513).cumsum(0).numpy(), np.arange(513).cumsum())
 
   def test_arange_cat(self):
     t = Tensor.arange(2, dtype=dtypes.int)+Tensor([3])
@@ -62,7 +66,7 @@ class TestIndexing(unittest.TestCase):
     print("*** indexing ***")
     with Context(NOOPT=1):
       GlobalCounters.reset()
-      rng = Tensor.ones(4, DDIM, DSET, dtype=dtypes.int)._cumalu(axis=-1, op=Ops.ADD, _include_initial=True).reshape(4, DDIM, DSET, 1)
+      rng = Tensor.arange(DSET, dtype=dtypes.int).reshape(1, 1, DSET, 1).expand(4, DDIM, DSET, 1)
       idxs = idxs.reshape(4,1,1,1).expand(4, DDIM, DSET, 1)
       reshape_dataset = dataset.T.reshape(1, DDIM, DSET, 1).expand(4, DDIM, DSET, 1)
       full = (rng==idxs).where(reshape_dataset, Tensor.zeros(4, DDIM, DSET, 1))
@@ -188,11 +192,36 @@ class TestIndexing(unittest.TestCase):
     for i in idx.flatten().numpy(): expected_grad[i] += 2
     np.testing.assert_allclose(emb.weight.grad.numpy(), expected_grad, rtol=1e-5, atol=1e-5)
 
-  # ~10x overhead in fused matmul bw with rope in bf16 vs float16
-  @unittest.skipUnless(Device.DEFAULT == "AMD" or (Device.DEFAULT == "NULL" and EMULATE.value.startswith("AMD")), "tests AMD bf16 cast overhead")
-  def base_test_llama_8b_rope_backward(self, dtype, ops_scale):
+  @needs_second_gpu
+  @unittest.skipIf(Device.DEFAULT not in ("CPU", "AMD"), "atomics only on AMD/CPU")
+  @Context(USE_ATOMICS=1, SPEC=1)
+  def test_embedding_backward_vocab_sharded(self):
+    from tinygrad.renderer.cstyle import CStyleLanguage
+    if Device.DEFAULT == "CPU" and not isinstance(Device["CPU"].renderer, CStyleLanguage): self.skipTest("CPU needs Clang renderer")
+    devices = (f"{Device.DEFAULT}:0", f"{Device.DEFAULT}:1")
+    vocab_size, embed_size = 1000, 128
+    bs, seqlen = 4, 256
+    idx = Tensor.randint(bs, seqlen, high=vocab_size)
+    emb = nn.Embedding(vocab_size, embed_size)
+    emb.weight = Tensor.ones(vocab_size, embed_size, requires_grad=True)
+    gt = Tensor.zeros(bs, seqlen, embed_size)
+    Tensor.realize(idx, emb.weight, gt)
+    # compute expected grad on single device
+    expected_grad = np.zeros((vocab_size, embed_size), dtype=np.float32)
+    for i in idx.flatten().numpy(): expected_grad[i] += 2
+    # now shard the embedding weight on vocab axis and recompute
+    emb.weight = Tensor.ones(vocab_size, embed_size, requires_grad=True)
+    emb.weight.shard_(devices, axis=0)
+    idx = idx.shard(devices, axis=None)
+    gt = gt.shard(devices, axis=None)
+    Tensor.realize(idx, emb.weight, gt)
+    loss = (emb(idx)-gt).square().sum()
+    loss.backward()
+    np.testing.assert_allclose(emb.weight.grad.numpy(), expected_grad, rtol=1e-5, atol=1e-5)
+
+  @unittest.skipUnless(Device.DEFAULT == "AMD" or (Device.DEFAULT == "NULL" and DEV.arch.startswith("gfx")), "tests AMD bf16 cast overhead")
+  def base_test_llama_8b_rope_backward(self, dtype):
     from extra.models.llama import precompute_freqs_cis, apply_rotary_emb
-    Tensor.training = True
     bs, seqlen, dim, n_heads = 1, 512, 256, 4
     head_dim = dim // n_heads
     x = Tensor.randn(bs, seqlen, dim, dtype=dtype)
@@ -209,12 +238,15 @@ class TestIndexing(unittest.TestCase):
     assert len(sched) == 1, f"expected one kernel for backward, got: {len(sched)}"
     prg = sched[0].lower().prg.p
     bwd_ops = prg.estimates.ops
+    # bfloat16 on non CDNA4 has ~10x ops overhead because of the software emulation
+    if dtype == dtypes.bfloat16 and not Device[Device.DEFAULT].renderer.target.arch.startswith("gfx950"): ops_scale = 10
+    else: ops_scale = 1
     expected_ops = bs*seqlen*dim*dim*ops_scale
     print(f"rope matmul bwd ({dtype}): {GlobalCounters.kernel_count} kernels, {bwd_ops:,} ops")
     self.assertLess(bwd_ops, expected_ops, f"rope bwd ops {bwd_ops:,} should be < {ops_scale} per (got {bwd_ops/(bs*seqlen*dim*dim):.1f})")
 
-  def test_llama_8b_rope_backward_f16(self): self.base_test_llama_8b_rope_backward(dtypes.float16, 1)
-  def test_llama_8b_rope_backward_bf16(self): self.base_test_llama_8b_rope_backward(dtypes.bfloat16, 11)
+  def test_llama_8b_rope_backward_f16(self): self.base_test_llama_8b_rope_backward(dtypes.float16)
+  def test_llama_8b_rope_backward_bf16(self): self.base_test_llama_8b_rope_backward(dtypes.bfloat16)
 
 if __name__ == "__main__":
   unittest.main()
