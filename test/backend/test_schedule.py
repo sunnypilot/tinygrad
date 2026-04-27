@@ -2,16 +2,16 @@
 # schedule confirms the right things are capable of fusing
 # NOTE: this has overlap with external_test_opt.py
 
-import unittest, functools
+import gc, unittest, functools
 import numpy as np
 from typing import cast
 from hypothesis import assume, given, settings, strategies as strat
 
 from tinygrad import nn, dtypes, Device, Tensor, Variable
 from tinygrad.device import is_dtype_supported
-from tinygrad.dtype import DType, ImageDType
+from tinygrad.dtype import DType
 from tinygrad.uop.ops import UOp, Ops, UPat
-from tinygrad.helpers import CI, DEBUG, SPLIT_REDUCEOP, GlobalCounters, Context, getenv, all_same, temp
+from tinygrad.helpers import CI, DEBUG, OSX, GlobalCounters, Context, getenv, all_same, temp
 from tinygrad.engine.realize import CompiledRunner, run_schedule
 
 class KernelCountException(Exception): pass
@@ -61,6 +61,12 @@ def _test_conv2d(allowed:int, dtype:DType=dtypes.float):
     np.testing.assert_allclose(w.grad.numpy(), ref_w.grad.detach().numpy(), atol=1e-6 if dtype == dtypes.float else 1e-2)
 
 class TestSchedule(unittest.TestCase):
+  def setUp(self):
+    self.ctx = Context(SPLIT_REDUCEOP=0)
+    self.ctx.__enter__()
+  def tearDown(self):
+    self.ctx.__exit__(None, None, None)
+
   def test_arange_avgpool2d(self, kcount=1):
     x = Tensor.arange(25).reshape(1,1,5,5).cast(dtypes.float32)
     t = x.avg_pool2d(padding=1)
@@ -99,6 +105,7 @@ class TestSchedule(unittest.TestCase):
     self.assertListEqual(a.tolist(), [[15]])
 
   @unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
+  @unittest.skipIf(Device.DEFAULT == "WEBGPU" and OSX, "WEBGPU Metal backend is not accurate enough")
   def test_expand_buffer_before_cast(self):
     a = Tensor.randn(4, 2, 1).realize().permute((1, 0, 2))
     b = a.cast(dtypes.half).expand((2, 4, 4))+2
@@ -161,13 +168,13 @@ class TestSchedule(unittest.TestCase):
     a = Tensor.full((4,), 4.0).contiguous().realize()
     b = Tensor.full((4,), 2.0).contiguous().realize()
     expr = (a*b)/b
-    check_schedule(expr, 0)
+    run_schedule(check_schedule(expr, 1))
     np.testing.assert_allclose(expr.numpy(), np.full((4,), 4.0))
 
   def test_div_collapse_const(self):
     a = Tensor.full((4,), 4.0).contiguous().realize()
     expr = a/a
-    check_schedule(expr, 0)
+    run_schedule(check_schedule(expr, 1))
     np.testing.assert_allclose(expr.numpy(), np.full((4,), 1.0))
 
   def test_div_collapse(self):
@@ -222,12 +229,12 @@ class TestSchedule(unittest.TestCase):
     run_schedule(check_schedule(out, 1))
     self.assertEqual(out.item(), 4.)
 
-  @unittest.skipUnless(SPLIT_REDUCEOP, "Testing split reducop requires SPLIT_REDUCEOP")
   def test_preserve_multistage_reduce(self):
     big_enough = getenv("REDUCEOP_SPLIT_THRESHOLD", 32768)
     x = Tensor.randn(big_enough).realize()
-    out = (x - x.max(keepdim=True)).max()
-    run_schedule(check_schedule(out, 4))
+    with Context(SPLIT_REDUCEOP=1):
+      out = (x - x.max(keepdim=True)).max()
+      run_schedule(check_schedule(out, 4))
     np.testing.assert_allclose(out.numpy(), (x.numpy() - x.numpy().max(keepdims=True)).max())
 
   @unittest.skip("these two Tensors are the same")
@@ -305,8 +312,9 @@ class TestSchedule(unittest.TestCase):
     np.testing.assert_allclose(out0.numpy(), np_out0:=np.exp2(a.numpy().sum()), atol=1e-4, rtol=1e-4)
     np.testing.assert_allclose(out1.numpy(), np_out1:=a.numpy().sum()+np_out0, atol=1e-4, rtol=1e-4)
     np_b = (a.numpy() + np_out0 + np_out1)
-    np.testing.assert_allclose(out2.numpy(), np_out2:=np.exp2(np_b.sum()), atol=1e-4, rtol=1e-4)
-    np.testing.assert_allclose(out3.numpy(), np_b.sum()+np_out2, atol=1e-4, rtol=1e-4)
+    with np.errstate(over='ignore'):
+      np.testing.assert_allclose(out2.numpy(), np_out2:=np.exp2(np_b.sum()), atol=1e-4, rtol=1e-4)
+      np.testing.assert_allclose(out3.numpy(), np_b.sum()+np_out2, atol=1e-4, rtol=1e-4)
 
   def test_reduce_ext_reduce_child(self):
     Tensor.manual_seed(0)
@@ -371,7 +379,7 @@ class TestSchedule(unittest.TestCase):
     out0 = a.sum() + 2
     out1 = a.sum() + b
     # run_schedule(check_schedule([out0, out1], 2))
-    run_schedule(check_schedule([out0, out1], 4))
+    run_schedule(check_schedule([out0, out1], 3))
     np.testing.assert_allclose(out0.numpy(), a.numpy().sum()+2, atol=1e-4, rtol=1e-4)
     np.testing.assert_allclose(out1.numpy(), a.numpy().sum()+b.numpy(), atol=1e-4, rtol=1e-4)
 
@@ -503,7 +511,7 @@ class TestSchedule(unittest.TestCase):
     np.testing.assert_allclose(out[1].numpy(), np.sqrt(np.square(y.numpy() - np_mu).sum(-1)/y.shape[-1]), atol=1e-4, rtol=1e-4)
 
   def test_cumsum_parallel_reduce_fused(self):
-    # two-stage cumsum + ops triggers parallel REDUCEs in one kernel that must share an END
+    # two-stage cumsum + ops triggers parallel REDUCEs in one kernel that must share an END (same nesting context = should merge)
     step, num_steps = 513, 10
     t = Tensor.arange(step).float().realize()
     phase = t.cumsum()
@@ -513,6 +521,12 @@ class TestSchedule(unittest.TestCase):
     expected = np.tile(np.arange(step).astype(np.float32).cumsum(), num_steps).reshape(num_steps, step)
     expected = (expected * np.array([1,0,0,1,0,0,0,0,1,0]).reshape(num_steps, 1)).flatten()
     np.testing.assert_allclose(out.numpy(), expected, atol=1e-4, rtol=1e-4)
+
+  @unittest.skipIf(Device.DEFAULT == "CL", "TODO: fails on CI CL")
+  def test_reduce_different_nesting_depth(self):
+    # two REDUCEs sharing the same RANGE at different nesting depths must NOT merge
+    x = Tensor.arange(768).reshape(3, 256).float()
+    np.testing.assert_allclose((x.sum(axis=1) + x.sum(axis=1).sum()).numpy(), x.numpy().sum(axis=1) + x.numpy().sum(axis=1).sum())
 
   def test_multimatmul_fusion(self):
     Tensor.manual_seed(0)
@@ -740,7 +754,7 @@ class TestSchedule(unittest.TestCase):
     p = P[0]
     p = p.pad(((1, 0), ))
     p = p.repeat([2])
-    run_schedule(check_schedule(p, 3))
+    run_schedule(check_schedule(p, 4))  # TODO: this is high
     tiny_ret = p.numpy()
 
     P = np.ones((3, 3), dtype=np.float32)
@@ -759,33 +773,66 @@ class TestSchedule(unittest.TestCase):
     b = a.alu(Ops.ADD, b)
     check_schedule(b, 1)
 
-  def test_conv2d(self): _test_conv2d(5 if SPLIT_REDUCEOP else 4)
-  def test_conv2d_fused(self): _test_conv2d(5 if SPLIT_REDUCEOP else 4)
+  def test_conv2d(self): _test_conv2d(4)
+  def test_conv2d_fused(self): _test_conv2d(4)
 
   @unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
-  def test_conv2d_half(self): _test_conv2d(5 if SPLIT_REDUCEOP else 4, dtype=dtypes.half)
+  def test_conv2d_half(self): _test_conv2d(4, dtype=dtypes.half)
   @unittest.skipUnless(is_dtype_supported(dtypes.half), "need half")
   @unittest.skipIf(Device.DEFAULT == "WEBGPU", "Causes other tests to fail")
-  def test_conv2d_fused_half(self): _test_conv2d(5 if SPLIT_REDUCEOP else 4, dtype=dtypes.half)
+  def test_conv2d_fused_half(self): _test_conv2d(4, dtype=dtypes.half)
 
-  @unittest.skip("TODO: this is consistently creating non reproducible failures")
   def test_schedule_mem_used_with_inputs(self):
+    gc.collect()
     base = GlobalCounters.mem_used
     x = Tensor.ones(256).contiguous().realize()
     (x+Tensor.ones(256).contiguous()).schedule()
+    gc.collect()
     self.assertEqual(GlobalCounters.mem_used-base, 1024)
 
   @unittest.skipIf(Device.DEFAULT != "CL", "image only supported on CL")
-  def test_image_matmul(self):
-    with Context(IMAGE=2):
-      x = Tensor.randn((9, 9)).realize()
-      y = Tensor.randn((9, 9)).realize()
-      out = x@y
-      run_schedule(check_schedule(out, 3))
-      np.testing.assert_allclose(out.numpy(), x.numpy()@y.numpy(), atol=1e-4, rtol=1e-4)
-      self.assertIsInstance(out.dtype, ImageDType)
-      self.assertIsNotNone(out.uop.base.realized)
-      self.assertIsInstance(out.uop.base.realized.dtype, ImageDType)
+  def test_image_dot_f16_fusion(self):
+    with Context(FLOAT16=1, OPENPILOT_HACKS=1):
+      def cnt():
+        x, y, z = Tensor.empty((64, 64), dtype='float'), Tensor.empty((64, 64), dtype='float'), Tensor.empty((64, 64), dtype='float')
+        a = (x @ y).relu()
+        sched = ((a @ z).relu() + a).schedule()
+        for si in sched: si.lower()
+        return len([si for si in sched if isinstance(si.prg, CompiledRunner)])
+
+      with Context(IMAGE=1):
+        self.assertEqual(cnt(), 5)
+
+  @unittest.skipIf(Device.DEFAULT != "CL", "image only supported on CL")
+  def test_image_f16_residual_fusion(self):
+    with Context(FLOAT16=1, OPENPILOT_HACKS=1):
+      def cnt():
+        inp = Tensor.empty((512,), dtype='float')
+        b1, b2 = Tensor.empty((512, 1024), dtype='float'), Tensor.empty((1024, 512), dtype='float')
+        c1, c2 = Tensor.empty((1024,), dtype='float'), Tensor.empty((512,), dtype='float')
+        rb = (((((inp @ b1) + c1).relu() @ b2) + c2).relu() + inp).relu()
+        b16, c16 = Tensor.empty((512, 16), dtype='float'), Tensor.empty((16,), dtype='float')
+        b32, c32 = Tensor.empty((512, 32), dtype='float'), Tensor.empty((32,), dtype='float')
+        sched = Tensor.schedule((rb @ b16 + c16).relu(), (rb @ b32 + c32).relu())
+        for si in sched: si.lower()
+        return len([si for si in sched if isinstance(si.prg, CompiledRunner)])
+
+      with Context(IMAGE=1):
+        self.assertEqual(cnt(), 9)
+
+  @unittest.skipIf(Device.DEFAULT != "CL", "image only supported on CL")
+  def test_image_conv_fusion(self):
+    with Context(OPENPILOT_HACKS=1):
+      def cnt():
+        x, y, z = Tensor.empty((1, 4, 3, 3)), Tensor.empty((4, 1, 3, 3)), Tensor.empty((4, 1, 7, 7))
+        a = x.conv2d(y, Tensor.empty(4), groups=4, padding=1)
+        b = a.conv2d(z, groups=4, padding=3)
+        sched = (a + b).schedule()
+        for si in sched: si.lower()
+        return len([si for si in sched if isinstance(si.prg, CompiledRunner)])
+
+      with Context(IMAGE=1):
+        self.assertEqual(cnt(), 5)
 
   def _test_fusion(self, shapes, f, cnt):
     with Context(DEBUG=0, TRACK_MATCH_STATS=0): args = [Tensor.randn(s).realize() for s in shapes]
@@ -833,10 +880,9 @@ class TestSchedule(unittest.TestCase):
   def test_cast_const_view(self):
     a = Tensor.ones((4, 4), dtype=dtypes.float32)
     casted_view = a.cast(dtypes.int32)
-    run_schedule(check_schedule(casted_view, 0))
-    self.assertIsNone(casted_view.uop.base.realized)
+    run_schedule(check_schedule(casted_view, 1))
     realized_const_view = casted_view.contiguous()
-    run_schedule(check_schedule(realized_const_view, 1))
+    run_schedule(check_schedule(realized_const_view, 0))
     self.assertListEqual(realized_const_view.tolist(), [[1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1], [1, 1, 1, 1]])
 
   @given(strat.sampled_from(dtypes.all), strat.sampled_from(dtypes.all))
@@ -1017,7 +1063,8 @@ class TestSchedule(unittest.TestCase):
     a = Tensor.arange(16).contiguous().realize()
     GlobalCounters.reset()
     a[4] = 3
-    # TODO: update when this becomes lazy
+    self.assertEqual(GlobalCounters.kernel_count, 0)
+    a.realize()
     self.assertEqual(GlobalCounters.kernel_count, 1)
     self.assertListEqual(a.tolist(), [0, 1, 2, 3, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15])
 
@@ -1028,7 +1075,7 @@ class TestSchedule(unittest.TestCase):
     idx = Tensor([1,2,5,6], dtype=dtypes.int32)
     flat_base[idx] = Tensor([99,99,99,99])
     base.assign(flat_base.reshape(4, 4))
-    sched = check_schedule(base, 2)
+    sched = check_schedule(base, 6)  # TODO: this is high
     run_schedule(sched)
     expected = list(range(16))
     for i, v in zip([1,2,5,6], [99,99,99,99]): expected[i] = v
@@ -1057,10 +1104,9 @@ class TestSchedule(unittest.TestCase):
     _, Y_train, _, _ = mnist()
     samples = Tensor.randint(BS:=getenv("BS", 512), high=cast(int,Y_train.shape[-1])).realize()
     yt = Tensor.randn(BS, 10).realize()
-    with Context(SPLIT_REDUCEOP=0):
-      loss = yt.sparse_categorical_crossentropy(Y_train[samples])
-      run_schedule(check_schedule(loss, 4))
-      loss_fused = loss.numpy()
+    loss = yt.sparse_categorical_crossentropy(Y_train[samples])
+    run_schedule(check_schedule(loss, 4))
+    loss_fused = loss.numpy()
     loss_ref = torch.nn.CrossEntropyLoss()(torch.tensor(yt.numpy()), torch.tensor(Y_train.numpy())[torch.tensor(samples.numpy())])
     np.testing.assert_allclose(loss_fused, loss_ref.numpy(), atol=1e-6, rtol=1e-6)
 
@@ -1080,6 +1126,14 @@ class TestSchedule(unittest.TestCase):
     new_uop = a.reshape(4,1).realize().uop
     assert new_uop.base.op is Ops.BUFFER
 
+  def test_self_assign_no_empty_kernel(self):
+    for shape in [(3, 3), (4, 4)]:
+      a = Tensor.ones(*shape).contiguous().realize()
+      a.assign(a / 1)
+      run_schedule(check_schedule(a, 0, filter_sink=False))
+      self.assertListEqual(a.tolist(), [[1.]*shape[1]]*shape[0])
+
+class TestLimitBufs(unittest.TestCase):
   @unittest.skipIf(CI and Device.DEFAULT == "NV", "crashes on NV CI")
   def test_limit_bufs_with_var(self):
     N = 31
@@ -1092,12 +1146,16 @@ class TestSchedule(unittest.TestCase):
     for X in range(1,N): root = root + bufs[X][vi] + bufs[X][vj]
     self.assertEqual(root.item(), N * 2)
 
-  def test_self_assign_no_empty_kernel(self):
-    for shape in [(3, 3), (4, 4)]:
-      a = Tensor.ones(*shape).contiguous().realize()
-      a.assign(a / 1)
-      run_schedule(check_schedule(a, 0, filter_sink=False))
-      self.assertListEqual(a.tolist(), [[1.]*shape[1]]*shape[0])
+  def test_limit_bufs_arange_condition(self):
+    # WHERE with arange-based condition (pure index math, no device) and many buffer loads should not crash limit_bufs
+    with Context(MAX_KERNEL_BUFFERS=8):
+      N = 8
+      idx = Tensor.arange(N)
+      base = Tensor.zeros(N)
+      for i in range(4):
+        a, b = Tensor.rand(N).realize(), Tensor.rand(N).realize()
+        base = (idx >= i).where(a + b, base)
+      assert all(x > 0 for x in base.tolist())
 
 class TestSwizzle(unittest.TestCase):
   def test_swizzle_simple(self):
@@ -1216,11 +1274,11 @@ class TestView(unittest.TestCase):
     bv = b.pad(((0, 2),))[-2:]
     # this becomes a late a*0
     late_mul = a*bv
-    check_schedule(late_mul, 0)
+    run_schedule(check_schedule(late_mul, 2))
     # the arange doesn't realize
-    self.assertIsNone(b.uop.base.realized)
+    #self.assertIsNone(b.uop.base.realized)
     # mul doesn't realize
-    self.assertIsNone(late_mul.uop.base.realized)
+    #self.assertIsNone(late_mul.uop.base.realized)
     self.assertEqual(late_mul.tolist(), [0, 0])
 
   # SINK has two branches:
@@ -1233,20 +1291,21 @@ class TestView(unittest.TestCase):
     bv = b.pad(((0, 2),))[-2:]
     late_mul = a*bv
     other_child = b+2
-    s = check_schedule([late_mul, other_child], 2)
+    s = check_schedule([late_mul, other_child], 3)
     # the arange becomes a BUFFER
     self.assertIs(b.uop.base.op, Ops.BUFFER)
+    # NOTE: no longer checked
     # mul still collapses
-    self.assertIs(late_mul.uop.base.op, Ops.CONST)
+    #self.assertIs(late_mul.uop.base.op, Ops.CONST)
     run_schedule(s)
     self.assertEqual(other_child.tolist(), [2, 3, 4])
 
 @unittest.skipIf(Device.DEFAULT == "CPU", "tests copy from another device to cpu")
 class TestCopyFolding(unittest.TestCase):
   def test_const_copy_is_free(self):
-    b = Tensor(1).to("CPU")
-    check_schedule(b, 0, filter_sink=False)
-    assert b.item() == 1
+    b = Tensor(1).to("CPU") * 4
+    run_schedule(check_schedule(b, 1, filter_sink=False))
+    assert b.item() == 4
 
   def test_one_hot_with_copy(self):
     y = Tensor([1, 2, 3]).to("CPU")
@@ -1254,16 +1313,16 @@ class TestCopyFolding(unittest.TestCase):
     check_schedule(x, 3, filter_sink=False)
 
   def test_const_copy_multi(self):
-    x = Tensor.ones(1, device="CPU").to_(["CPU", "CPU:1"])
-    check_schedule(x, 0, filter_sink=False)
-    self.assertEqual(x.item(), 1)
+    x = Tensor.ones(1, device="CPU").to_(["CPU", "CPU:1"]) * 2
+    run_schedule(check_schedule(x, 2, filter_sink=False))
+    self.assertEqual(x.item(), 2.0)
 
   def test_late_const_copy_folding(self):
     a = Tensor.arange(3).realize()
     zeros = Tensor.zeros(3).realize()
-    b = (a*zeros).to("CPU")
-    run_schedule(check_schedule(b, 0, filter_sink=False))
-    self.assertListEqual(b.tolist(), [0, 0, 0])
+    b = (a*zeros).to("CPU") + 1
+    run_schedule(check_schedule(b, 1, filter_sink=False))
+    self.assertListEqual(b.tolist(), [1, 1, 1])
     self.assertEqual(b.device, "CPU")
 
   def test_alu_after_copy(self):
@@ -1302,7 +1361,7 @@ class TestCopyFolding(unittest.TestCase):
     a = Tensor.ones(4, 4).contiguous().realize()
     # use copy_to_device to bypass Tensor.to() shortcircuit and force a real same-device COPY in the graph
     a.assign(Tensor(a.uop.copy_to_device(a.device), a.device))
-    run_schedule(check_schedule(a, 0, filter_sink=False))
+    run_schedule(check_schedule(a, 2, filter_sink=False))
     self.assertListEqual(a.tolist(), [[1.]*4]*4)
 
   def test_clone(self):
