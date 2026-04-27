@@ -7,8 +7,7 @@ if "JIT_BATCH_SIZE" not in os.environ: os.environ["JIT_BATCH_SIZE"] = "0"
 
 from tinygrad import fetch, Tensor, TinyJit, Context, GlobalCounters, Device, dtypes
 from tinygrad.helpers import DEBUG, getenv
-from tinygrad.uop.ops import Ops
-from tinygrad.engine.realize import get_runner
+from tinygrad.engine.realize import CompiledRunner
 from tinygrad.nn.onnx import OnnxRunner
 
 OPENPILOT_MODEL = sys.argv[1] if len(sys.argv) > 1 else "https://github.com/commaai/openpilot/raw/v0.9.7/selfdrive/modeld/models/supercombo.onnx"
@@ -35,15 +34,11 @@ def compile(onnx_file):
   for i in range(3):
     GlobalCounters.reset()
     print(f"run {i}")
-    with Context(DEBUG=max(DEBUG.value, 2 if i == 2 else 1), OPENPILOT_HACKS=1):
+    with Context(DEBUG=max(DEBUG.value, 2 if i == 2 else 1)):
       ret = run_onnx_jit(**inputs).numpy()
     # copy i == 1 so use of JITBEAM is okay
     if i == 1: test_val = np.copy(ret)
-  # iterate kernel CALLs in the captured LINEAR UOp; toposort descends into batched graph CUSTOM_FUNCTIONs
-  kernel_asts = {Ops.SINK, Ops.PROGRAM}
-  kernel_calls = [u for u in run_onnx_jit.captured.linear.toposort(gate=lambda x: x.op not in kernel_asts)
-                  if u.op is Ops.CALL and u.src[0].op in kernel_asts]
-  print(f"captured {len(kernel_calls)} kernels")
+  print(f"captured {len(run_onnx_jit.captured.jit_cache)} kernels")
   np.testing.assert_equal(test_val, ret, "JIT run failed")
   print("jit run validated")
 
@@ -51,14 +46,13 @@ def compile(onnx_file):
   kernel_count = 0
   read_image_count = 0
   gated_read_image_count = 0
-  for call in kernel_calls:
-    device = next(b.device for b in call.src[1:] if b.op is not Ops.BIND)
-    src = get_runner(device, call.src[0]).p.src
-    kernel_count += 1
-    read_image_count += src.count("read_image")
-    gated_read_image_count += src.count("?read_image")
-    for v in [m.group(1) for m in re.finditer(r'(val\d+)\s*=\s*read_imagef\(', src)]:
-      if len(re.findall(fr'[\?\:]{v}\.[xyzw]', src)) > 0: gated_read_image_count += 1
+  for ei in run_onnx_jit.captured.jit_cache:
+    if isinstance(ei.prg, CompiledRunner):
+      kernel_count += 1
+      read_image_count += ei.prg.p.src.count("read_image")
+      gated_read_image_count += ei.prg.p.src.count("?read_image")
+      for v in [m.group(1) for m in re.finditer(r'(val\d+)\s*=\s*read_imagef\(', ei.prg.p.src)]:
+        if len(re.findall(fr'[\?\:]{v}\.[xyzw]', ei.prg.p.src)) > 0: gated_read_image_count += 1
   print(f"{kernel_count=},  {read_image_count=}, {gated_read_image_count=}")
   if (allowed_kernel_count:=getenv("ALLOWED_KERNEL_COUNT", -1)) != -1:
     assert kernel_count == allowed_kernel_count, f"different kernels! {kernel_count=}, {allowed_kernel_count=}"

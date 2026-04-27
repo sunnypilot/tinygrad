@@ -4,7 +4,7 @@ import triton.language as tl
 from triton.compiler import AttrsDescriptor, ASTSource, compile as triton_compile
 import numpy as np
 from tinygrad import Tensor, dtypes, Device
-from tinygrad.engine.realize import CompiledRunner, ProgramSpec
+from tinygrad.engine.realize import CompiledRunner, ExecItem, ProgramSpec
 from tinygrad.helpers import getenv
 np.set_printoptions(suppress=True)
 
@@ -73,11 +73,8 @@ if __name__ == "__main__":
 
   A, B = Tensor.normal(M, K, std=1e-1, dtype=dtypes.float16).realize(), Tensor.normal(K, N, std=1e-1, dtype=dtypes.float16).realize()
   C = A.matmul(B)
-  from tinygrad.uop.ops import Ops
-  linear, var_vals = C.linear_with_vars()
-  last_call = linear.src[-1]
-  ast = last_call.src[0]
-  bufs = [s.buffer for s in last_call.src[1:] if s.op is not Ops.BIND]
+  sched = C.schedule()
+  si = sched[-1]
 
   src = compiled.asm["ptx"]
   # specify the shared memory here so we don't need to do it dynamically
@@ -91,21 +88,19 @@ if __name__ == "__main__":
   prg = ProgramSpec("matmul_kernel", src, device=Device.DEFAULT,
                 global_size=[M//BLOCK_SIZE_M, N//BLOCK_SIZE_N, 1], local_size=[32*compiled.metadata.num_warps, 1, 1],
                 mem_estimate=A.nbytes() + B.nbytes() + C.nbytes())
-  runner = CompiledRunner(prg)
-  all_bufs = [x.ensure_allocated() for x in bufs]
-  prg_bufs = [all_bufs[i] for i in runner.p.globals]
+  ei = ExecItem(si.ast, [x.ensure_allocated() for x in si.bufs], si.metadata, prg=CompiledRunner(prg))
   tflops = []
   for i in range(5):
-    tm = runner(prg_bufs, {}, wait=True)
+    tm = ei.run(wait=True)
     tflops.append((2*M*K*N/tm)*1e-12)
   print(f"TFLOPS: {max(tflops):.2f}")
 
   # check correctness
   if getenv("VERIFY"):
-    from tinygrad.engine.realize import run_linear
+    from tinygrad.engine.realize import run_schedule
     triton_buf = np.frombuffer(si.bufs[0].as_memoryview(), np.float16).reshape(M,N)
     print(triton_buf)
-    run_linear(linear, var_vals)
+    run_schedule(sched)
     tinygrad_buf = np.frombuffer(si.bufs[0].as_memoryview(), np.float16).reshape(M,N)
     print(tinygrad_buf)
     np.testing.assert_allclose(triton_buf, tinygrad_buf)

@@ -113,7 +113,7 @@ class VLIWRenderer(Renderer):
         case Ops.GEP:
           # a GEP is just an alias to a special register in the vector
           r[u] = r[u.src[0]] + u.arg[0]
-        case Ops.STACK:
+        case Ops.VECTORIZE:
           if all(s == u.src[0] for s in u.src):
             # if all sources are the same, we can broadcast
             inst.append({"valu": [("vbroadcast", r[u], r[u.src[0]])]})
@@ -176,7 +176,7 @@ if __name__ == "__main__":
   from tinygrad.codegen import get_program
   with Context(PCONTIG=2, DEVECTORIZE=2, SPEC=0):
     out = tree_traversal(forest_t, val_t, height, rounds)
-    sink = out.schedule_linear().src[-1].src[0]
+    sink = out.schedule()[-1].ast
     prg = get_program(sink, VLIWRenderer())
 
   # *** run on Machine and compare ***
