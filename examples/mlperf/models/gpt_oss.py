@@ -12,15 +12,16 @@ from tinygrad.helpers import Timing, colored, GlobalCounters, profile_marker
 from tinygrad.uop.ops import Ops, UOp
 from extra.models.llama import apply_rotary_emb
 from extra.llama_kernels.rmsnorm import rmsnorm
-from extra.gemm.cdna_asm_gemm import _mx_block_scale, _mx_block_scale_3d, quantize_mxfp8, asm_gemm, can_use_asm_gemm
+from extra.gemm.cdna_asm_gemm import _mx_block_scale, _mx_block_scale_3d, quantize_mxfp8, asm_gemm, can_use_asm_gemm, mx_pack
 from extra.gemm.moe_gemm import grouped_mx_gemm
-from extra.gemm.moe_routing import route, dispatch, combine
+from extra.gemm.moe_routing import route, dispatch, combine, router_mfma
+from extra.gptoss_kernels.embedding import GPTOSSEmbedding
 
 FP8_DTYPE = dtypes.fp8e4m3
 FP8_MAX = 448.0
 INIT_STD = 0.02
 ASM_GEMM = getenv("ASM_GEMM", 0)
-
+PRESTORE_WT = getenv("PRESTORE_WT", 0)
 
 def _quant_dequant_fwd(x:Tensor) -> Tensor:
   # x (2d bf16) -> bf16 value after an mxfp8 round-trip (1x32 block scaling on the last axis)
@@ -41,7 +42,7 @@ def _quant_dequant_bwd(grad:UOp, call:UOp) -> tuple:
 
 def quant_dequant_mx(x:Tensor) -> Tensor:
   fxn = _quant_dequant_fwd_fxn(x.as_param(0).uop, x.device)
-  return Tensor(UOp.maketuple(fxn.uop).call(x.uop, grad_fxn=_quant_dequant_bwd).gettuple(0))
+  return Tensor(fxn.uop.call_with_output(x.uop, grad_fxn=_quant_dequant_bwd))
 
 def _mx_scale(e8:Tensor) -> Tensor:
   return _mx_block_scale(e8) if e8.ndim == 2 else _mx_block_scale_3d(e8)
@@ -58,10 +59,27 @@ def _dequant_bwd(grad:UOp, call:UOp) -> tuple:
 
 def dequant_weight(w_q:Tensor, w_scale:Tensor) -> Tensor:
   fxn = _dequant_fwd_fxn(w_q.as_param(0).uop, w_scale.as_param(1).uop, w_q.device)
-  call = UOp.maketuple(fxn.uop).call(w_q.uop, w_scale.uop, grad_fxn=_dequant_bwd)
-  return Tensor(call.gettuple(0))
+  return Tensor(fxn.uop.call_with_output(w_q.uop, w_scale.uop, grad_fxn=_dequant_bwd))
 
-def matmul_mx(x:Tensor, w_q:Tensor, w_scale:Tensor) -> Tensor:
+def matmul_mx(x:Tensor|tuple[Tensor, Tensor], w_q:Tensor, w_scale:Tensor) -> Tensor:
+  if isinstance(x, tuple):
+    assert ASM_GEMM, "pre-quantized MXFP8 input requires ASM_GEMM"
+    from extra.gemm.cdna_asm_gemm import asm_gemm, can_use_asm_gemm, mx_pack
+    x_q, x_e8 = x
+    l_shape, padded = x_q.shape[:-1], x_q.shape[-1]
+    x_q, x_e8 = x_q.reshape(-1, padded), x_e8.reshape(-1, padded // 32)
+    K, N = w_q.shape[1], w_q.shape[0]
+    assert padded >= K and (padded - K) % 32 == 0 and x_e8.shape[-1] == padded // 32
+    wq, ws = w_q, w_scale
+    if (pad := padded - K):
+      wq = wq.pad(((0, 0), (0, pad)))
+      ws = ws.pad(((0, 0), (0, pad // 32)), value=127).cast(dtypes.uint8)
+    if (npad := (-N) % 256):
+      wq = wq.pad(((0, npad), (0, 0)))
+      ws = ws.pad(((0, npad), (0, 0)), value=127).cast(dtypes.uint8)
+    assert can_use_asm_gemm(x_q, wq.T)
+    out = asm_gemm(x_q, wq.T, mx=True, mx_scales=(mx_pack(x_e8), x_e8, mx_pack(ws), ws), mx_w_stored=True)
+    return (out[:, :N] if npad else out).reshape(*l_shape, N).cast(dtypes.bfloat16)
   l_shape = x.shape[:-1]
   if ASM_GEMM:
     from extra.gemm.cdna_asm_gemm import asm_gemm, can_use_asm_gemm, mx_pack
@@ -131,10 +149,16 @@ class GPTOSS:
     self.w_gate_up_bias = Tensor.zeros(n_layers, n_experts, intermediate_size * 2, dtype=dtypes.bfloat16).contiguous()
     self.w_down, self.w_down_scale = self._quant_weight(n_layers, n_experts, dim, intermediate_size, std=scaled_std, moe=True)
     self.w_down_bias = Tensor.zeros(n_layers, n_experts, dim, dtype=dtypes.bfloat16).contiguous()
+    if PRESTORE_WT:
+      self.w_gate_up_wT, self.w_gate_up_wT_scale = self._make_wT(self.w_gate_up, self.w_gate_up_scale)
+      self.w_down_wT, self.w_down_wT_scale = self._make_wT(self.w_down, self.w_down_scale)
 
     # output
     self.norm = nn.RMSNorm(dim, norm_eps)
-    self.tok_embeddings = nn.Embedding(vocab_size, dim)
+    if getenv("GPTOSS_EMBEDDING", 0):
+      self.tok_embeddings = GPTOSSEmbedding(vocab_size, dim)
+    else:
+      self.tok_embeddings = nn.Embedding(vocab_size, dim)
     self.tok_embeddings.weight = Tensor.normal(vocab_size, dim, mean=0.0, std=INIT_STD, dtype=dtypes.bfloat16)
     self.output = Tensor.normal(vocab_size, dim, mean=0.0, std=INIT_STD, dtype=dtypes.bfloat16)
     self.freqs_cis = precompute_freqs_cis(head_dim, max_context * 2, rope_theta).contiguous().is_param_(False)
@@ -149,6 +173,15 @@ class GPTOSS:
       for q in qs: q[0]._zero2 = True  # grad arrives sharded on the expert axis under ZeRO-2 (moe_gemm)
       return [q[0] for q in qs], [q[1] for q in qs]
     return _one(*shape)
+
+  def _make_wT(self, weights:list[Tensor], scales:list[Tensor]):
+    wtq, wte = [], []
+    for w_q, w_e8 in zip(weights, scales):
+      wq, we, _ = quantize_mxfp8((w_q.cast(dtypes.bfloat16) * _mx_block_scale_3d(w_e8).cast(dtypes.bfloat16)).transpose(1, 2))
+      wq, we = wq.is_param_(False), we.is_param_(False)
+      wq._prestore_wT = we._prestore_wT = True
+      wtq.append(wq); wte.append(we)
+    return wtq, wte
 
   def _attn_mask(self, seqlen:int, dtype) -> Tensor:
     i, j = Tensor.arange(seqlen).reshape(seqlen, 1), Tensor.arange(seqlen).reshape(1, seqlen)
@@ -175,8 +208,22 @@ class GPTOSS:
   def attention(self, x:Tensor, freqs_cis:Tensor, mask:Tensor, sliding:bool, *, attention_norm:Tensor, wqkv:Tensor,
                 wqkv_scale:Tensor, wqkv_bias:Tensor, wo:Tensor, wo_scale:Tensor, wo_bias:Tensor, sinks:Tensor):
     bsz, seqlen, _ = x.shape
-    x_normed, rrms = rmsnorm(x, self.norm_eps)
-    qkv = matmul_mx(x_normed * attention_norm, wqkv, wqkv_scale) + wqkv_bias
+
+    if getenv("FUSED_RMSNORM_MX", 0):
+      from extra.gptoss_kernels.rmsnorm import rmsnorm_mul_quantize_mxfp8
+      x_q, x_e8, rrms = rmsnorm_mul_quantize_mxfp8(x, attention_norm, self.norm_eps)
+      qkv = matmul_mx((x_q, x_e8), wqkv, wqkv_scale) + wqkv_bias
+      norm_saves = [x_q, x_e8, rrms]
+    if getenv("FUSED_RMSNORM_MUL", 0):
+      from extra.gptoss_kernels.rmsnorm import rmsnorm_mul
+      x_normed, rrms = rmsnorm_mul(x, attention_norm, self.norm_eps)
+      qkv = matmul_mx(x_normed, wqkv, wqkv_scale) + wqkv_bias
+      norm_saves = [x_normed, rrms]
+    else:
+      x_normed, rrms = rmsnorm(x, self.norm_eps)
+      qkv = matmul_mx(x_normed * attention_norm, wqkv, wqkv_scale) + wqkv_bias
+      norm_saves = [x_normed, rrms]
+
     qkv = qkv.reshape(bsz, seqlen, self.n_kv_heads, self.n_rep + 2, self.head_dim)
     xq = qkv[:, :, :, :self.n_rep].reshape(bsz, seqlen, self.n_heads, self.head_dim)
     xk, xv = qkv[:, :, :, self.n_rep], qkv[:, :, :, self.n_rep + 1]
@@ -202,14 +249,20 @@ class GPTOSS:
       attn = (w @ xvm).permute(0, 3, 1, 2, 4).reshape(bsz, seqlen, self.n_heads * self.head_dim)
 
     out = matmul_mx(attn, wo, wo_scale) + wo_bias
-    return out, [x_normed, rrms, attn] + fa_saves
+    return out, [attn] + norm_saves + fa_saves
 
   def feed_forward(self, x:Tensor, *, ffn_norm:Tensor, gate:Tensor, gate_bias:Tensor,
                    w_gate_up:Tensor, w_gate_up_scale:Tensor, w_gate_up_bias:Tensor,
                    w_down:Tensor, w_down_scale:Tensor, w_down_bias:Tensor):
-    x_normed, rrms = rmsnorm(x, self.norm_eps)
-    inp = x_normed * ffn_norm
-    logits = inp.float() @ gate.float().T + gate_bias.float()
+    if getenv("FUSED_RMSNORM_MUL", 0):
+      from extra.gptoss_kernels.rmsnorm import rmsnorm_mul
+      x_normed, rrms = rmsnorm_mul(x, ffn_norm, self.norm_eps)
+      inp = x_normed
+    else:
+      x_normed, rrms = rmsnorm(x, self.norm_eps)
+      inp = x_normed * ffn_norm
+
+    logits = router_mfma(inp, gate, gate_bias) if getenv("ROUTER_MFMA", 0) else inp.float() @ gate.float().T + gate_bias.float()
     dim, inter = self.dim, self.intermediate_size
 
     if getenv("GROUPED_MOE", 0):
@@ -267,11 +320,29 @@ class GPTOSS:
                         w_down=self.w_down[i], w_down_scale=self.w_down_scale[i], w_down_bias=self.w_down_bias[i])
       h, *_ = self.run_layer(h, freqs_cis, mask_full, i % 2 == 0, attn_kwargs, ffn_kwargs, save=save)
 
-    h_normed = self.norm(h)
-    pad = (-self.dim) % 256
-    h_padded, w_padded = h_normed.pad((None, None, (0, pad))), self.output.pad(((0, 0), (0, pad)))
-    if ASM_GEMM and can_use_asm_gemm(h_padded, w_padded.T): logits = asm_gemm(h_padded, w_padded.T)
-    else: logits = h_normed @ self.output.T
+    if getenv("FAST_FINAL_RMSNORM", 0):
+      from extra.gptoss_kernels.rmsnorm import fast_final_rmsnorm
+      h_normed = fast_final_rmsnorm(h, self.norm.weight, self.norm_eps)
+    else: h_normed = self.norm(h)
+
+    if getenv("FP8_LMHEAD", 0) and ASM_GEMM:
+      pad = (-self.dim) % 256
+      h2 = h_normed.reshape(-1, self.dim).pad(((0, 0), (0, pad)))
+      w2 = self.output.pad(((0, 0), (0, pad)))
+      hq, he8, hsi = quantize_mxfp8(h2)
+      oq, oe8, _ = quantize_mxfp8(w2)
+      if hsi is not None and can_use_asm_gemm(hq, oq.T):
+        logits = asm_gemm(hq, oq.T, mx=True, mx_scales=(hsi, he8, mx_pack(oe8), oe8), mx_w_stored=False)
+        logits = logits.reshape(bsz, seqlen, self.vocab_size).cast(dtypes.bfloat16)
+      else:
+        logits = h_normed @ self.output.T
+    elif ASM_GEMM:
+      pad = (-self.dim) % 256
+      h_padded, w_padded = h_normed.pad((None, None, (0, pad))), self.output.pad(((0, 0), (0, pad)))
+      logits = asm_gemm(h_padded, w_padded.T) if can_use_asm_gemm(h_padded, w_padded.T) and getenv("VOCAB_ASM", 1) else h_normed @ self.output.T
+    else:
+      logits = h_normed @ self.output.T
+
     return logits
 
 def _get_pads(uop:UOp) -> list[UOp]:

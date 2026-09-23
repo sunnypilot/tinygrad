@@ -3,12 +3,13 @@ from tinygrad import Device, Tensor, dtypes
 from tinygrad.helpers import mv_address, DEBUG, DEV
 from test.helpers import slow, replace_opts
 from tinygrad.device import Buffer, BufferSpec
-from tinygrad.runtime.support.hcq import HCQCompiled, HCQBuffer
+from extra.hcq1.hcq import HCQCompiled, HCQBuffer
 from tinygrad.runtime.autogen import libc
 from tinygrad.runtime.support.system import PCIIfaceBase
 from tinygrad.engine.realize import get_runtime
 from tinygrad.codegen import to_program
 from tinygrad.codegen.opt import Opt, OptOps
+from tinygrad.uop.ops import AxisType
 from tinygrad import Variable
 
 MOCKGPU = DEV.interface.startswith("MOCK")
@@ -167,7 +168,7 @@ class TestHCQ(unittest.TestCase):
     b = a + 1
     si = b.schedule_linear().src[-1]
 
-    prg = to_program(replace_opts(si.src[0], [Opt(op=OptOps.LOCAL, axis=0, arg=3) for _ in range(3)]), TestHCQ.d0.renderer)
+    prg = to_program(replace_opts(si.src[0], [Opt(op=OptOps.SPLIT, axis=0, arg=(3, AxisType.LOCAL)) for _ in range(3)]), TestHCQ.d0.renderer)
     runtime = get_runtime(Device.DEFAULT, prg)
 
     zb = Buffer(Device.DEFAULT, 3 * 3 * 3, dtypes.int, options=BufferSpec(cpu_access=True, nolru=True)).ensure_allocated()
@@ -234,7 +235,7 @@ class TestHCQ(unittest.TestCase):
       buf2 = Buffer(Device.DEFAULT, sz, dtypes.int8, options=BufferSpec(host=True, nolru=True)).ensure_allocated()
 
       ctypes.memset(buf2._buf.va_addr, 0x3e, sz)
-      buf2_q_view = buf2._buf.cpu_view().view(fmt='Q')
+      buf2_q_view = buf2.host.view(fmt='Q')
       for i in range(0, sz//8, 0x1000):
         for j in range(32): buf2_q_view[min(max(i + j - 16, 0), (sz // 8) - 1)] = random.randint(0, 0xffffffffffffffff)
 
@@ -566,7 +567,7 @@ class TestHCQ(unittest.TestCase):
 
     sz = 0x2000
     cpu_buffer = Buffer("CPU", sz, dtypes.uint8, options=BufferSpec(cpu_access=True)).ensure_allocated()
-    cpu_buffer._buf.cpu_view().view(fmt='B')[:] = bytes([x & 0xff for x in range(sz)])
+    cpu_buffer.host.view(fmt='B')[:] = bytes([x & 0xff for x in range(sz)])
 
     for devid in range(6):
       if DEBUG >= 2: print(f"Testing map to device {Device.DEFAULT}:{devid}")
