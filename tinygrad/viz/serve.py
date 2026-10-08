@@ -155,7 +155,7 @@ def uop_to_json(data:VizData, x:UOp) -> dict[int, dict]:
         label += "\n"+' '.join([f"{range_str(s, color=True)}({s.vmax+1})" for s in trngs])
     except Exception:
       label += "\n<ISSUE GETTING LABEL>"
-    ref = data.ref_map.get(canonicalize_ast(u.src[0])) if u.op is Ops.CALL else None
+    ref = data.ref_map.get(canonicalize_ast(u.body)) if u.op is Ops.CALL else None
     if ref is not None: label += f"\ncodegen@{fmt_colored(data.ctxs[ref]['name'])}"
     # NOTE: kernel already has metadata in arg
     if TRACEMETA >= 2 and u.metadata is not None and u.op is not Ops.CALL: label += "\n"+str(u.metadata)
@@ -413,6 +413,15 @@ def sqtt_timeline(data:bytes, lib:bytes, target:str) -> Generator[ProfileEvent, 
     if row not in row_ends: yield ProfilePointEvent(row, "JSON", "pcMap", pc_map, ts=Decimal(0))
     yield (e:=ProfileRangeEvent(row, TracingKey(name, ret="JSON"+json.dumps(link) if link else None), Decimal(start_time), Decimal(end_time)))
     row_ends[row] = unwrap(e.en)
+    if name == "VALU_MAI_MFMA" and info is not None and info.inst.op_name.startswith("V_MFMA_"):
+      from tinygrad.runtime.autogen.amd.cdna.ins import VOP3PX2, VOP3P_MFMA
+      # derive exec from dispatch and inst, CDNA doesn't have ALUEXEC packets
+      ss = info.inst.op_name.removeprefix("V_MFMA_").removeprefix("SCALE_").split("_")
+      duration = max(8, m:=int(ss[1].split("X", 1)[0]))
+      if (m != 4 and (ss[2].endswith("B") or ss[-1] == "F32")) or \
+         (ss[-1] == "F8F6F4" and isinstance(info.inst, (VOP3P_MFMA, VOP3PX2)) and (info.inst.cbsz < 2 or info.inst.blgp < 2)): duration *= 2
+      yield ProfileRangeEvent(f"ALUEXEC:0 MFMA SIMD:{simd}", TracingKey("MFMA", ret="JSON"+json.dumps({"link":f"{row}-{idx}"})),
+                              Decimal(p._time+(mfma_delay:=4)), Decimal(p._time+mfma_delay+duration))
     # barrier on this wave extends to fill the time it was waiting
     if wave is not None:
       if (barrier:=curr_barrier.pop(wave, None)) is not None: barrier.en = Decimal(p._time)
@@ -650,7 +659,8 @@ def get_render(viz_data:VizData, query:str, **kwargs) -> dict:
   if fmt.startswith("sqtt"):
     ret = {}
     with soft_err(lambda err:ret.update(err)):
-      if (events:=get_profile(viz_data, list(itertools.islice(sqtt_timeline(*data), getenv("MAX_SQTT_PKTS", 50_000))), sort_fn=row_tuple)):
+      if (events:=get_profile(viz_data, list(itertools.islice(sqtt_timeline(*data), None if (max_pkts:=getenv("MAX_SQTT_PKTS", 50_000)) == -1
+                                                              else max_pkts)), sort_fn=row_tuple)):
         ret = {"value":events, "content_type":"application/octet-stream"}
       else: ret = {"src":"No SQTT trace on this SE."}
     return ret

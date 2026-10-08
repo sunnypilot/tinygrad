@@ -557,7 +557,7 @@ jobs:
     - name: run warp pickle
       run: BENCHMARK_LOG=usbgpu_openpilot_driving_warp GMMU=0 DEV=USB+AMD python3 examples/openpilot/load_pickle.py --run warp.pkl
     - name: Test copy speeds
-      run: SIZE=64000000 PYTHONPATH=. GMMU=0 DEV=USB+AMD python3 test/external/external_test_usb_asm24.py
+      run: SIZE=64000000 GMMU=0 DEV=USB+AMD taskset -c 4-7 python3 test/external/external_test_usb_asm24.py
 
   driverbenchmarks:
     name: PCI Driver Benchmark (DEV=${{ matrix.dev }})

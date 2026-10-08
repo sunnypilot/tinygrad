@@ -295,7 +295,7 @@ def usb_stream(h:UOp, addr:UOp, data:UOp, n:UOp|int, write:bool) -> UOp: # 0xF0 
 def is_host(b:UOp) -> bool: return b.device is None or not all_devices_in(b.device, HCQ_DEVS - {"CPU"}) # stack or host memory
 def usb_wire(size:UOp|int) -> UOp|int: return (size + 512 + SLOT - 1) // SLOT * SLOT # payload and sentinel block, slot aligned
 def usb_sentinel(g:UOp) -> UOp: return ((g & 0xFFFFFF) | 0x51000000).cast(dtypes.uint32)
-def is_staged(call:UOp) -> bool: return call.op is Ops.CALL and call.src[0].op is Ops.COPY and is_host(call.src[1]) != is_host(call.src[2])
+def is_staged(call:UOp) -> bool: return call.op is Ops.CALL and call.body.op is Ops.COPY and is_host(call.src[1]) != is_host(call.src[2])
 def usb_chunks(call:UOp) -> list[tuple[UOp, int, int]]: # (host view, byte offset, bytes) per chunk
   host, win = (call.src[2], CHUNK) if is_host(call.src[2]) else (call.src[1], 2 * CHUNK)
   return [(host, off, min(win, host.nbytes() - off)) for off in range(0, host.nbytes(), win)]
@@ -384,7 +384,7 @@ def usb_chunk(h:UOp, table:UOp, i:UOp, half:int, run:int) -> UOp: # send chunk i
   h = h.after(usb_drained(h, n))
   h = h.after(usb_ctrl(h, 0x40, 0xF2, wire // 512, ((end - wire) // SLOT) | (wire // SLOT << 8), UOp.const(0, dtypes.uint64), 0))
   field = functools.partial(cfield, xfer:=xfer.after(h), libusb.struct_libusb_transfer)
-  xfer = xfer.after(field("status").store(0xff), field("length").store(wire),
+  xfer = xfer.after(field("status").store(0xff), field("length").store(wire.cast(dtypes.uint)),
                     field("buffer").store(rt_addr(stage) + (end - wire).cast(dtypes.uint64)))
   return ccall(libusb.libusb_submit_transfer, xfer.index(0))
 
@@ -444,7 +444,7 @@ def usb_store(b:UOp, idx:UOp, v:UOp) -> UOp:
   # each control transfer writes 32 bits
   h, addr = usb_link(b.device).after(*usb_deps(b)), usb_addr(b, idx, v.dtype)
   loop, value = None, v
-  if str(unwrap_view(b)[0].tag).startswith("kernargs"):
+  if v.dtype.itemsize == 8 and str(unwrap_view(b)[0].tag).startswith("kernargs"):
     cache = UOp.placeholder((1,), v.dtype, device=HCQ_RUNTIME_DEV.value, volatile=True, tag="usb_arg_cache")
     cache = cache.after(cache.store(UOp(Ops.BINARY, arg=bytes(v.dtype.itemsize)).bitcast(v.dtype)))
     loop = UOp.range(cache.index(0).load().ne(v).cast(dtypes.int), next(UOp.unique_num), dtype=dtypes.int,
