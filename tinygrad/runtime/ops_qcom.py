@@ -281,10 +281,13 @@ class QCOMProgramData:
     reg_desc_off = _read_lib(lib, 0x34)
     self.fregs, self.hregs = _read_lib(lib, reg_desc_off + 0x14), _read_lib(lib, reg_desc_off + 0x18)
 
-_qcom_program_cache:dict[tuple[bytes, tuple[str, ...]], tuple[QCOMProgramData, UOp]] = {}
+_qcom_program_cache:dict[tuple[bytes, tuple[str, ...], tuple], tuple[QCOMProgramData, UOp]] = {}
 def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[QCOMProgramData, UOp]:
-  if (cached:=_qcom_program_cache.get(key:=(prg.src[3].arg, devs))) is None:
-    data = QCOMProgramData(dev, prg.to_elf())
+  # the signature is part of the key: identical OpenCL source (and binary) can come from kernels whose images differ only in dtype
+  # (image2d_t + read_imagef is the same for half and float), and the texture descriptors are built from the signature dtypes
+  elf = prg.to_elf()
+  if (cached:=_qcom_program_cache.get(key:=(elf.lib, devs, elf.signature))) is None:
+    data = QCOMProgramData(dev, elf)
     image = bytes(data.image).ljust(round_up(len(data.image), 4), b"\x00")
     buf = UOp.placeholder((len(image),), dtypes.uint8, next(UOp.unique_num), device=devs).rtag("program")
     cached = _qcom_program_cache[key] = (data, patch(buf, [], image))
