@@ -187,6 +187,8 @@ def exec_hcq(ctx:ExecContext, call:UOp, ast:UOp) -> list[float|None]:
   slots = {d: cast(Buffer, call.src[1 + i].buffer) for d, i in info.slots}
   for d in {d for devs, _, _, prof, *_ in info.kernels for d in devs if prof and (slots[d], prof[0]) in Device[d].prof_ents}: Device[d].synchronize()
   ets = exec_kernel(ctx, call, ast, devices=(Device[info.device[0]].host,))
+  for d in info.device:
+    if (err:=Device[d].error_state.host.view(fmt='q')[0]): raise RuntimeError(f"{d} failed with {err}")
   if not (ctx.wait or PROFILE): return ets
 
   for devs, name, _, prof, pkey, *_ in info.kernels:
