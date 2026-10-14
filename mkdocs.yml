@@ -120,6 +120,8 @@ plugins:
 - mkdocstrings:
     handlers:
       python:
+        inventories:
+        - https://docs.python.org/3/objects.inv
         paths: [tinygrad]
         options:
           docstring_options:

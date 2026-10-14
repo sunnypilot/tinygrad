@@ -591,8 +591,6 @@ def decode(data: bytes) -> Iterator[PacketType]:
   """Decode raw SQTT blob, yielding packet instances. Auto-detects RDNA (layout 3/4) vs CDNA."""
   n, reg, pos, nib_off, nib_count, time, ts_offset = len(data), 0, 0, 0, 16, 0, None
   decode_info, state_table = _DECODE_INFO_RDNA3, _STATE_TABLE_RDNA3  # start RDNA3, auto-detect switches if needed
-  # in CDNA, packets can arrive before timestamp does, queue them here
-  packets_since_reset:list[PacketType] = []
 
   while pos + ((nib_count + nib_off + 1) >> 1) <= n:
     need = nib_count - nib_off
@@ -616,15 +614,8 @@ def decode(data: bytes) -> Iterator[PacketType]:
     elif special == 4:  # CDNA_TIMESTAMP (absolute timestamp anchoring)
       if (reg >> 4) & 0xfff == 0:  # unk_0 == 0 means absolute timestamp
         abs_ts = reg >> 16
-        if packets_since_reset: time = packets_since_reset[0]._time
         if ts_offset is None: ts_offset = abs_ts - time
         else: time = ((abs_ts - ts_offset) & ~3) - 4
-        if packets_since_reset:
-          shift = time - packets_since_reset[0]._time
-          for buffered in packets_since_reset: buffered._time += shift
-          time = packets_since_reset[-1]._time
-          yield from packets_since_reset
-          packets_since_reset.clear()
       delta = 0
     time += delta
     pkt = pkt_cls.from_raw(reg, time)
@@ -638,12 +629,7 @@ def decode(data: bytes) -> Iterator[PacketType]:
         if special == 4 and (reg >> 4) & 0xfff == 0:  # CDNA_TIMESTAMP absolute
           ts_offset = (reg >> 16) - time
         pkt = pkt_cls.from_raw(reg, time)
-    if isinstance(pkt, CDNA_MISC) and pkt.misc_type == 1: # TIME_RESET
-      yield from packets_since_reset
-      packets_since_reset = [pkt]
-    elif packets_since_reset: packets_since_reset.append(pkt)
-    else: yield pkt
-  yield from packets_since_reset
+    yield pkt
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAPPER
@@ -658,13 +644,13 @@ class InstructionInfo:
 def map_insts(data:bytes, lib:bytes, target:str) -> Iterator[tuple[PacketType, InstructionInfo|None]]:
   """maps SQTT packets to instructions, yields (packet, instruction_info or None)"""
   # map pcs to insts
-  from tinygrad.viz.serve import amd_decode, get_arch, get_elf_section
-  pc_map = amd_decode((text:=get_elf_section(lib, ".text")).content, get_arch(target), text.header.sh_addr)
+  from tinygrad.viz.serve import amd_decode
+  pc_map = amd_decode(lib, target)
   wave_pc:dict[tuple[int, int], int] = {}
-  cdna_imm_queue:dict[tuple[int, int], list[CDNA_ISSUE]] = {}
+  cdna_imm_queue:dict[tuple[int, int], list[CDNA_ISSUE|None]] = {}
   def cdna_imm_dequeue(key:tuple[int, int]) -> Iterator[tuple[PacketType, InstructionInfo]]:
     pending = cdna_imm_queue[key]
-    while pending and ((p:=pending[0]).inst >> (key[1]*2)) & 3 == 3:
+    while pending and (p:=pending[0]) is not None:
       pending.pop(0)
       if (inst:=pc_map[pc:=wave_pc[key]]).op_name not in {'S_NOP', 'S_WAITCNT', 'S_SETPRIO'}: continue
       wave_pc[key] += inst.size()
@@ -689,11 +675,11 @@ def map_insts(data:bytes, lib:bytes, target:str) -> Iterator[tuple[PacketType, I
           yield (p, InstructionInfo(pc, wave, inst))
     elif isinstance(p, CDNA_ISSUE):
       for wave in range(10):
-        if ((p.inst >> (wave * 2)) & 3) in {2, 3}:
-          cdna_imm_queue.setdefault(key:=(p.simd, wave), []).append(p)
+        if (status:=(p.inst >> (wave * 2)) & 3) in {2, 3}:
+          cdna_imm_queue.setdefault(key:=(p.simd, wave), []).append(p if status == 3 else None)
           yield from cdna_imm_dequeue(key)
     elif isinstance(p, CDNA_INST):
-      p._time = cdna_imm_queue[(p.simd, p.wave)].pop(0)._time
+      cdna_imm_queue[(p.simd, p.wave)].pop(0)
       inst = pc_map[pc:=wave_pc[(p.simd, p.wave)]]
       if p.op == InstOpCDNA.JUMP:
         x = getattr(inst, 'simm16') & 0xffff

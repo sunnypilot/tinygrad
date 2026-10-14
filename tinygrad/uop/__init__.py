@@ -16,14 +16,14 @@ class Ops(FastEnum):
   # this is a RANGE for GPU dimensions, similar to symbolic shapes but not exactly
   SPECIAL = auto()
 
-  # BUFFER references bound storage; ALLOC declares unbound global storage
-  BUFFER = auto(); ALLOC = auto()
+  # BUFFER allocates global/local/register storage depending on its addrspace
+  BUFFER = auto()
 
   # ** 2 -- non op uops **
 
   # uops that aren't rendered
   NOOP = auto(); REWRITE_ERROR = auto()
-  # CALL is a kernel invocation; value-producing calls write to ALLOC arguments
+  # CALL is a kernel invocation; calls with RETURNED inputs are value-producing (and gradient-able), the rest are opaque
   PARAM = auto(); CALL = auto()
 
   # renderer
@@ -31,7 +31,8 @@ class Ops(FastEnum):
   PROGRAM = auto(); LINEAR = auto(); SOURCE = auto(); BINARY = auto()
 
   # AFTER passes src[0] through and promises in the toposort that any consumers of the AFTER run after src[1:]
-  SINK = auto(); AFTER = auto()
+  # GROUP is a NOOP that just merges things together
+  SINK = auto(); AFTER = auto(); GROUP = auto()
 
   # vector creation / item selection
   STACK = auto()
@@ -70,7 +71,6 @@ class Ops(FastEnum):
 
   # control flow ops
   BARRIER = auto(); RANGE = auto(); IF = auto(); END = auto(); ENDIF = auto()
-  BACKEDGE = auto()  # (body, unbounded RANGE, condition): repeat while condition is true
 
   # const.
   CONST = auto()
@@ -89,8 +89,8 @@ class Ops(FastEnum):
   # buffer ops
   STAGE = auto(); COPY = auto(); MSELECT = auto(); MSTACK = auto(); CUSTOM_FUNCTION = auto()
 
-  # the core 5 movement ops! these only exist in the tensor graph
-  RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto()
+  # the core 6 movement ops! these only exist in the tensor graph
+  RESHAPE = auto(); PERMUTE = auto(); EXPAND = auto(); PAD = auto(); FLIP = auto()
   UNSHARD = auto()  # UNSHARD is really a movement op
 
   # reduce
@@ -111,10 +111,10 @@ class GroupOp:
   # TODO: is BITCAST always Elementwise if it's shape changing?
   Elementwise = set.union(ALU, {Ops.CAST, Ops.BITCAST})
 
-  Defines = {Ops.PARAM, Ops.BUFFER, Ops.ALLOC}
+  Defines = {Ops.PARAM, Ops.BUFFER}
 
   Irreducible = {Ops.CONST, Ops.SPECIAL, Ops.RANGE, Ops.PARAM, Ops.GETADDR}
-  Movement = {Ops.RESHAPE, Ops.EXPAND, Ops.PERMUTE, Ops.PAD, Ops.SHRINK}
+  Movement = {Ops.RESHAPE, Ops.EXPAND, Ops.PERMUTE, Ops.PAD, Ops.SHRINK, Ops.FLIP}
 
   # BinaryOps that can be flipped
   Commutative = {Ops.ADD, Ops.MUL, Ops.MAX, Ops.CMPNE, Ops.CMPEQ, Ops.XOR, Ops.AND, Ops.OR}

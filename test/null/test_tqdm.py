@@ -12,9 +12,6 @@ def _get_iter_per_second(raw:str) -> float:
   if raw.endswith("M"): return float(raw[:-1])*1e6
   return float(raw)
 
-class TTYStringIO(StringIO):
-  def isatty(self): return True
-
 # TODO: _get_iter_per_second in test_unit_scale might fail if lower bound is too small
 NCOLS_RANGE = [80, 240]
 
@@ -45,7 +42,7 @@ class TestProgressBar(unittest.TestCase):
     diff = sum([c1 != c2 for c1, c2 in zip(prog1, prog2)])  # allow 1 char diff to be less flaky, but it should match
     assert diff <= 1, f"{diff=}\n{prog1=}\n{prog2=}"
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_tqdm_output_iter(self, mock_terminal_size, mock_stderr):
     for _ in range(10):
@@ -70,7 +67,7 @@ class TestProgressBar(unittest.TestCase):
       self._compare_bars(tinytqdm_output, tqdm_output)
 
   @unittest.skip("this is flaky")
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_unit_scale(self, mock_terminal_size, mock_stderr):
     for unit_scale in [True, False]:
@@ -96,7 +93,7 @@ class TestProgressBar(unittest.TestCase):
             self._compare_bars(tinytqdm_output, tqdm_output)
             if n > 3: break
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_unit_scale_exact(self, mock_terminal_size, mock_stderr):
     unit_scale = True
@@ -131,7 +128,7 @@ class TestProgressBar(unittest.TestCase):
         self._compare_bars(tinytqdm_output, tqdm_output)
         if n > 5: break
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_si_boundary(self, mock_terminal_size, mock_stderr):
     """Test SI formatting at boundaries (e.g., 999.5 -> 1.00k, not 1000)"""
@@ -152,7 +149,7 @@ class TestProgressBar(unittest.TestCase):
       self._compare_bars(tinytqdm_output, tqdm_output)
 
   @unittest.skip("this is flaky")
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_set_description(self, mock_terminal_size, mock_stderr):
     for _ in range(10):
@@ -179,7 +176,7 @@ class TestProgressBar(unittest.TestCase):
       tqdm_output = tqdm.format_meter(n=total, total=total, elapsed=elapsed, ncols=ncols, prefix=expected_prefix)
       self._compare_bars(tinytqdm_output, tqdm_output)
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_trange_output_iter(self, mock_terminal_size, mock_stderr):
     for _ in range(5):
@@ -203,7 +200,7 @@ class TestProgressBar(unittest.TestCase):
       tqdm_output = tqdm.format_meter(n=total, total=total, elapsed=elapsed, ncols=ncols, prefix="Test")
       self._compare_bars(tiny_output, tqdm_output)
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_tqdm_output_custom(self, mock_terminal_size, mock_stderr):
     for _ in range(10):
@@ -227,7 +224,7 @@ class TestProgressBar(unittest.TestCase):
         tqdm_output = tqdm.format_meter(n=n, total=total, elapsed=elapsed, ncols=ncols, prefix="Test")
         self._compare_bars(tinytqdm_output, tqdm_output)
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_tqdm_output_custom_0_total(self, mock_terminal_size, mock_stderr):
     for _ in range(10):
@@ -251,7 +248,7 @@ class TestProgressBar(unittest.TestCase):
         tqdm_output = tqdm.format_meter(n=n, total=0, elapsed=elapsed, ncols=ncols, prefix="Test")
         self.assertEqual(tinytqdm_output, tqdm_output)
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_tqdm_output_custom_nolen_total(self, mock_terminal_size, mock_stderr):
     for unit_scale in [True, False]:
@@ -275,7 +272,7 @@ class TestProgressBar(unittest.TestCase):
           self.assertEqual(tinytqdm_output, tqdm_output)
           if n > 5: break
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_tqdm_write(self, mock_terminal_size, mock_stderr):
     for _ in range(5):
@@ -291,7 +288,7 @@ class TestProgressBar(unittest.TestCase):
         self.assertEqual(tinytqdm_out.split("\r\033[K")[-1], tqdm_out.split(f"{i-1}\n")[-1])
       self.assertEqual(tinytqdm_out, tinytqdm_out)
 
-  @patch('sys.stderr', new_callable=TTYStringIO)
+  @patch('sys.stderr', new_callable=StringIO)
   @patch('shutil.get_terminal_size')
   def test_tqdm_context_manager(self, mock_terminal_size, mock_stderr):
     for _ in range(10):
@@ -308,18 +305,6 @@ class TestProgressBar(unittest.TestCase):
       elapsed = total/iters_per_sec
       tqdm_output = tqdm.format_meter(n=total, total=total, elapsed=elapsed, ncols=ncols, prefix="Test")
       self._compare_bars(tinytqdm_output, tqdm_output)
-
-  @patch('sys.stderr', new_callable=StringIO)
-  @patch('shutil.get_terminal_size')
-  def test_tqdm_no_tty_no_cr(self, mock_terminal_size, mock_stderr):
-    # when stderr is not a tty (e.g. CI logs, piped to a file), only the final report should be printed
-    ncols = 80
-    mock_terminal_size.return_value = namedtuple(field_names='columns', typename='terminal_size')(ncols)
-    for _ in tinytqdm(range(100), desc="Test"):
-      pass
-    out = mock_stderr.getvalue()
-    self.assertEqual(out.count("\r"), 0)
-    self.assertIn("100/100", out)
 
   def test_tqdm_perf(self):
     st = time.perf_counter()
