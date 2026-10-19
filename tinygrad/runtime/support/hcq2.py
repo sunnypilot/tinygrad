@@ -537,7 +537,7 @@ def _source_stamp() -> str:
   return hashlib.sha256(str(files).encode()).hexdigest()
 
 def _disk_key(linear:UOp, profile:bool) -> str:
-  devs = sorted({d for c in linear.src if (ds:=get_enqueue_devs(c)) is not None for d in to_tuple(ds)} | {HCQ_RUNTIME_DEV.value})
+  devs = sorted({d for c in linear.src if (ds:=get_enqueue_devs(c)) is not None for d in to_tuple(ds)} | {HCQ_RUNTIME_DEV.device})
   return "|".join([_source_stamp(), linear.key.hex(), str(profile), str(ALL2ALL >= 1), *(f"{d}={Device[d].renderer.target!r}" for d in devs)])
 
 @rewrite_group(lambda linear,input_uops,profile,cache=False,ret=None: f"HCQ Compile {pluralize('Kernel', len(ret.src))}")
