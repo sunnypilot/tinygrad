@@ -22,7 +22,7 @@ from tinygrad.runtime.ops_python import PythonRenderer
 def full_rewrite(sink:UOp, ren:Renderer|None=None) -> UOp:
   if ren is None: ren = Renderer(Target())
   if sink.arg is None: sink = sink.replace(arg=KernelInfo())
-  return full_rewrite_to_sink(sink, ren, optimize=sink.tag is None)
+  return full_rewrite_to_sink(sink, ren, optimize=sink.arg is None or not sink.arg.optimized)
 
 def get_uops(sink:UOp, ren:Renderer|None=None) -> list[UOp]:
   """Extract linearized UOps from a sink. Test helper that only does linearization (no render)."""
@@ -149,7 +149,7 @@ def eval_uop(uop:UOp, inputs:list[tuple[DType, list[Any]]]|None=None, vals:tuple
   prg = to_program(UOp.store(g.index(UOp.const(0)), uop).sink(arg=KernelInfo()), PythonRenderer(Target("PYTHON")))
   prog = dev.runtime(prg.to_elf())
   out_buf = Buffer("PYTHON", uop.dtype.itemsize, preallocate=True)
-  prog(out_buf._buf, *[b.buf for b in bufs], vals=vals)
+  prog(out_buf._buf, *[b.buf for b in bufs], *vals)
   return out_buf.as_memoryview().cast(uop.dtype.fmt or "").tolist()[0]
 
 def to_uops_list(u:list[UOp], ren=None) -> list[UOp]:

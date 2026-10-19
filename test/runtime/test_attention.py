@@ -2,7 +2,8 @@ import unittest
 import numpy as np
 from tinygrad import Tensor, dtypes, nn
 from tinygrad.llm.model import (
-  GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig,
+  GatedDeltaNetBlock, SSMConfig, TransformerBlock, TransformerConfig, MLATransformerBlock, Indexer, IndexerConfig,
+  HyperConnection, HCConfig,
   apply_rope as apply_rope_new, precompute_freqs_cis, pairwise_topk,
 )
 from test.helpers import slow
@@ -69,6 +70,38 @@ class TestAttention(unittest.TestCase):
     expected = apply_rope_new(k[..., :rope_dim], block.freqs_cis[:seqlen]).cat(k[..., rope_dim:], dim=-1)
     np.testing.assert_allclose(block.cache_kv[0, :, :, :seqlen, :].numpy(), expected.numpy(), rtol=1e-5, atol=1e-5)
 
+  def test_hyperconnection(self):
+    hc = HyperConnection(self._make_config(dim=1, hc=HCConfig(count=2, sinkhorn_iters=1, eps=0.0)))
+    hc.fn.weight = Tensor.zeros(8, 2)
+    hc.base["weight"] = Tensor([0., 0., 0., 0., float(np.log(3)), 0., 0., 0.])
+    # pre averages streams [1, 3] to 2, the sublayer squares it to 4, and post adds 4 to both streams
+    # mixing rows [3/4, 1/4], [1/2, 1/2] normalize to [3/5, 1/3], [2/5, 2/3]
+    expected = [[[[4 + (3/5 + 3*2/5)], [4 + (1/3 + 3*2/3)]]]]
+    actual = hc(Tensor([[[[1.], [3.]]]]), lambda x: x.square())
+    np.testing.assert_allclose(actual.numpy(), expected, rtol=1e-6, atol=1e-7)
+
+  def test_indexer(self):
+    indexer = Indexer(self._make_config(dim=2, q_lora_rank=2, indexer=IndexerConfig(n_heads=1, head_dim=2, top_k=2, kpool=2, norm_eps=1e-6)))
+    indexer.attn_q_b.weight, indexer.attn_k.weight = Tensor.eye(2), Tensor.eye(2)
+    indexer.proj.weight, indexer.compressor_gate.weight = Tensor.ones(1, 2), Tensor.zeros(2, 2)
+    x, q = Tensor([[[2., 0.], [2., 0.], [0., 2.], [0., 2.]]]), Tensor([[[1., -1.], [1., -1.], [1., -1.], [-1., 1.]]])
+    indexer._init_state(x)
+    # the first three queries prefer the first pool, the final query selects the completed second pool
+    expected = np.where([[1, 0, 0, 0], [1, 1, 0, 0], [1, 1, 1, 0], [0, 0, 1, 1]], 0., -np.inf)
+    np.testing.assert_array_equal(indexer(x, q, 0).numpy(), expected[None, None])
+
+  def test_mla_indexer_mask(self):
+    idx = IndexerConfig(n_heads=1, head_dim=2, top_k=2, kpool=2, norm_eps=1e-6)
+    block = MLATransformerBlock(self._make_config(dim=2, kv_lora_rank=2, q_lora_rank=2, max_context=5, indexer=idx))
+    block.attn_q_a.weight = Tensor([[1., 1.], [-1., -1.]])
+    block.indexer.attn_q_b.weight, block.indexer.attn_k.weight = Tensor.eye(2), Tensor.eye(2)
+    block.indexer.proj.weight, block.indexer.compressor_gate.weight = Tensor.ones(1, 2), Tensor.zeros(2, 2)
+    x = Tensor([[[2., 0.], [2., 0.], [0., 2.], [0., 2.], [0., 2.]]])
+    block._init_state(x)
+    # every query prefers the first pool, and incomplete pools contribute only their visible tail
+    expected = np.where([[1, 0, 0, 0, 0], [1, 1, 0, 0, 0], [1, 1, 1, 0, 0], [1, 1, 0, 0, 0], [1, 1, 0, 0, 1]], 0., -np.inf)
+    np.testing.assert_array_equal(block._attn_mask(x, 0).numpy(), expected[None, None])
+
 class TestGatedDeltaNetBlock(unittest.TestCase):
   def _tensor_linspace(self, start:float, stop:float, shape:tuple[int, ...]) -> Tensor:
     return Tensor.linspace(start, stop, int(np.prod(shape)), dtype=dtypes.float32).reshape(*shape)
@@ -119,8 +152,8 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
     x_float = x.astype(np.float32)
     return (x_float / np.sqrt((x_float * x_float).mean(axis=-1, keepdims=True) + eps)) * weight.astype(np.float32)
 
-  def _normalize_np(self, x:np.ndarray, eps:float=1e-6) -> np.ndarray:
-    return x / np.maximum(np.sqrt((x * x).sum(axis=-1, keepdims=True)), eps)
+  def _l2norm_np(self, x:np.ndarray, eps:float=1e-6) -> np.ndarray:  # as in the FLA kernels
+    return x / np.sqrt((x * x).sum(axis=-1, keepdims=True) + eps)
 
   def _softplus_np(self, x:np.ndarray) -> np.ndarray:
     return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
@@ -155,8 +188,8 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
       conv_window = np.concatenate([conv_state, self._linear_np(x_half, qkv_weight)], axis=1)
       conv_out = self._silu_np((conv_window * conv_weight).sum(axis=1))
       q, k, v = np.split(conv_out, [block.q_dim, 2 * block.q_dim], axis=-1)
-      q = self._normalize_np(q.reshape(B, block.num_k_heads, block.head_k_dim))
-      k = self._normalize_np(k.reshape(B, block.num_k_heads, block.head_k_dim))
+      q = self._l2norm_np(q.reshape(B, block.num_k_heads, block.head_k_dim))
+      k = self._l2norm_np(k.reshape(B, block.num_k_heads, block.head_k_dim))
       v = v.reshape(B, block.num_v_heads, block.head_v_dim)
       if block.num_v_heads != block.num_k_heads:
         k_repeat = block.num_v_heads // block.num_k_heads
@@ -214,6 +247,19 @@ class TestGatedDeltaNetBlock(unittest.TestCase):
                                  err_msg=f"GatedDeltaNet reset conv cache mismatch at step {step}")
       np.testing.assert_allclose(recurrent_state, expected_recurrent[step], rtol=1e-3, atol=1e-3,
                                  err_msg=f"GatedDeltaNet reset recurrent cache mismatch at step {step}")
+
+  def test_kda_qk_l2norm(self):
+    # q/k are normalized as x/sqrt(sum(x²)+1e-6) like FLA: tiny vectors aren't scaled up to unit length
+    ssm = SSMConfig(conv_kernel=4, state_size=8, group_count=2, time_step_rank=2, inner_size=16, kda=True)
+    block = GatedDeltaNetBlock(self._make_config(dim=16, n_heads=2, ssm=ssm), ssm)
+    block.attn_qkv.weight = Tensor([1e-4]*32 + [1.0]*16).reshape(48, 1).expand(48, 16) / 16  # x of ones: q = k = 1e-4, v = 1
+    block.ssm_conv1d["weight"], block.ssm_beta.weight = Tensor.ones(48, 4), Tensor.zeros(2, 16)
+    x = Tensor.ones(1, 1, 16)
+    block._init_state(x)
+    block._attention(x, 0).realize()
+    # the first token's state is beta * v (x) l2norm(k), with beta = sigmoid(0) and v, k through the conv and silu
+    def silu(z): return z / (1 + np.exp(-z))
+    np.testing.assert_allclose(block.recurrent_state.numpy(), 0.5 * silu(1.0) * silu(1e-4) / np.sqrt(8 * silu(1e-4)**2 + 1e-6), rtol=1e-3)
 
   def test_kda_channel_decay(self):
     config = self._make_config(dim=4, hidden_dim=8, n_heads=2, head_dim=4, rope_dim=4, v_head_dim=4,

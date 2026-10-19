@@ -568,8 +568,9 @@ class Parser:
         if op == '*': return left * right
         return (left // right) if dtypes.is_int(left.dtype) else (left / right)
       case '**': return UOp(Ops.EXP2, src=(right.cast(left.dtype),)) if _single_value(left) == 2.0 else left
+      case '%': return left % right
 
-  _PREC = [('||',), ('&&',), ('|',), ('^',), ('&',), ('==', '!=', '<>'), ('>=', '<=', '>', '<'), ('>>', '<<'), ('+', '-'), ('*', '/'), ('**',)]
+  _PREC = [('||',), ('&&',), ('|',), ('^',), ('&',), ('==', '!=', '<>'), ('>=', '<=', '>', '<'), ('>>', '<<'), ('+', '-'), ('*', '/', '%'), ('**',)]
 
   def binop(self, prec: int) -> UOp:
     if prec >= len(self._PREC): return self.unary()
@@ -715,6 +716,9 @@ class Parser:
         dt_name = self.eat('IDENT').val
         return result.cast(DTYPES.get(dt_name, dtypes.uint32))
       return result
+    if field in ('i24', 'u24'):
+      val = base.cast(dtypes.uint32) & _u32(0xFFFFFF)
+      return _signext_from_bit(val, _u32(24)).bitcast(dtypes.int32) if field == 'i24' else val
     dt = DTYPES.get(field)
     if dt is None: return base
     if dt == base.dtype: return base

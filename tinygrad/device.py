@@ -2,19 +2,23 @@ from __future__ import annotations
 from dataclasses import dataclass, replace, field
 from collections import defaultdict
 from typing import Any, Callable, Generic, TypeVar, Iterator, Generator, Self, TYPE_CHECKING
-import importlib, inspect, functools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, mmap, time, statistics
+import importlib, inspect, functools, itertools, pathlib, os, contextlib, re, atexit, pickle, decimal, subprocess, struct, mmap, time, statistics
 from tinygrad.helpers import mv_address, LRU, getenv, diskcache_get, diskcache_put, DEBUG, GlobalCounters, PROFILE, temp, colored
 from tinygrad.helpers import Context, CCACHE, ALLOW_DEVICE_USAGE, MAX_BUFFER_SIZE, cpu_events, ProfileEvent, ProfilePointEvent, suppress_finalizing
 from tinygrad.helpers import select_by_name, select_first_inited, DEV, TracingKey, size_to_str, pluralize, Target, unwrap, round_up, is_numpy_ndarray
-from tinygrad.helpers import cpu_profile, perf_counter_us, to_name, HCQ_RUNTIME_DEV
-from tinygrad.dtype import dtypes, DType
+from tinygrad.helpers import cpu_profile, perf_counter_us, HCQ_RUNTIME_DEV, to_tuple
+from tinygrad.dtype import dtypes, DType, AddrSpace
 from tinygrad.runtime.support.memory import BumpAllocator, MMIOInterface
 if TYPE_CHECKING:
   from tinygrad.renderer import Renderer
+  from tinygrad.uop.ops import UOp
 
 # **************** Device ****************
 
 ALL_DEVICES = ["METAL", "AMD", "NV", "CUDA", "QCOM", "CL", "CPU", "DSP", "WEBGPU"]
+HCQ_DEVS = frozenset(("AMD", "NV", "QCOM", "CUDA", "HIP", "NULL", "METAL"))
+HOST_DEVS = frozenset(("CPU", "PYTHON"))
+UVM_DEVS = frozenset(("QCOM", "METAL")) # the host maps their memory, so copies are host memcpys
 class _Device:
   def __init__(self) -> None:
     self._devices = [x.stem[len("ops_"):].upper() for x in (pathlib.Path(__file__).parent/"runtime").iterdir() if x.stem.startswith("ops_")]
@@ -64,7 +68,7 @@ def canonicalize_device(device:str|tuple|list|None) -> str|tuple[str, ...]:
   return canonical[0] if len(canonical:=tuple(Device.canonicalize(d) for d in device)) == 1 else canonical
 
 def is_disk_device(device:str|tuple[str, ...]) -> bool:
-  return any(d.split(":", 1)[0].upper() == "DISK" for d in ((device,) if isinstance(device, str) else device))
+  return any(d.split(":", 1)[0].upper() == "DISK" for d in to_tuple(device))
 
 # **************** Profile ****************
 
@@ -108,7 +112,7 @@ class Buffer:
   def __init__(self, device:str, nbytes:int, opaque:Any=None, options:BufferSpec|None=None,
                initial_value:bytes|pickle.PickleBuffer|None=None, base:Buffer|None=None, offset:int=0, preallocate=False,
                allocator:Allocator|None=None):
-    self.device, self.nbytes, self.offset, self.allocated_views, self._base = Device.canonicalize(device), nbytes, offset, 0, base
+    self.device, self.nbytes, self.offset, self._base = Device.canonicalize(device), nbytes, offset, base
     if allocator is not None: self.allocator = allocator
     self.options = options if options is not None else BufferSpec()
     self._storage:BufferStorage|None = None
@@ -185,7 +189,6 @@ class Buffer:
         GlobalCounters.mem_used += self.nbytes
         GlobalCounters.mem_used_per_device[self.device] += self.nbytes
       if PROFILE: Buffer.profile_events.append(ProfilePointEvent(self.device, "alloc", self.trace_num, {"nbytes":self.nbytes}))
-    elif self._storage is None: self.base.allocated_views += 1
     self._storage, self._base_storage = storage, self.base._storage if self._base else None
     return self
 
@@ -198,7 +201,6 @@ class Buffer:
         GlobalCounters.mem_used_per_device[self.device] -= self.nbytes
       if PROFILE: Buffer.profile_events.append(ProfilePointEvent(self.device, "free", self.trace_num))
       self.allocator.free(self._storage, self.nbytes, self.options)
-    else: self.base.allocated_views -= 1
     self._storage, self._base_storage = None, None
 
   def __reduce_ex__(self, protocol):
@@ -250,11 +252,10 @@ DeviceType = TypeVar('DeviceType', bound='Compiled')
 class Allocator(Generic[DeviceType]):
   lru = True
 
-  def __init__(self, dev:DeviceType, supports_copy_from_disk:bool=True, supports_transfer:bool=True):
+  def __init__(self, dev:DeviceType):
     self.dev: DeviceType = dev
     self.default_buffer_spec: BufferSpec = BufferSpec()
     self.cache:dict[tuple[int, BufferSpec|None], list[BufferStorage]] = defaultdict(list)
-    self.supports_copy_from_disk, self.supports_transfer = supports_copy_from_disk, supports_transfer
 
   def alloc(self, size:int, options:BufferSpec|None=None) -> BufferStorage:
     assert size > 0, f"alloc size must be positive, getting {size}"
@@ -291,10 +292,8 @@ class Allocator(Generic[DeviceType]):
   def _map(self, buf) -> BufferStorage: raise NotImplementedError("need map")
   def _unmap(self, mb): pass  # default no-op; override if _map allocates iface-side state
   def _offset(self, buf, size:int, offset:int): raise NotImplementedError("need offset")
-  # def _transfer(self, dest, src, sz:int, src_dev, dest_dev):
 
 class HostAllocator(Allocator):
-  def __init__(self, dev): super().__init__(dev, supports_copy_from_disk=False, supports_transfer=False)
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     if options.external_ptr is not None: view, meta = self._view(options.external_ptr, size), None
     elif (remote:=getattr(self.dev, "remote", None)) is not None: view, meta = remote.alloc_sysmem(round_up(size, mmap.PAGESIZE))
@@ -348,20 +347,20 @@ class TinyELF:
   lib: bytes
   name: str
   target: Target
-  # tuple of (name, slot, dtype, shape)
-  signature: tuple[tuple[str|None, int, DType, tuple], ...]
+  # tuple of (name, addrspace, dtype, shape), one per arg in the kernel's order. an ALU arg is a value, the rest are buffers
+  signature: tuple[tuple[str|None, AddrSpace, DType, tuple], ...]
   profile_key: bytes|None = None
 
   @staticmethod
-  def iter_sig(signature:tuple[tuple[str|None, int, DType, tuple], ...], offset:int=0) -> Generator[tuple[int, DType], None, None]:
-    for _,_,dt,_ in signature:
+  def iter_sig(signature:tuple[tuple[str|None, AddrSpace, DType, tuple], ...], offset:int=0) -> Generator[tuple[int, DType], None, None]:
+    for _,a,dt,_ in signature:
+      if a is not AddrSpace.ALU: dt = dtypes.uint64 # a buffer is passed by its address
       yield (offset:=round_up(offset, dt.itemsize)), dt
       offset += dt.itemsize
 
 class Program(Generic[DeviceType]):
   def __init__(self, dev:DeviceType, obj:TinyELF): pass
-  def __call__(self, *bufs, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), vals:tuple[int, ...]=(),
-               wait=False) -> float|None: pass
+  def __call__(self, *args, global_size:tuple[int,int,int]=(1,1,1), local_size:tuple[int,int,int]=(1,1,1), wait=False) -> float|None: pass
 
 class Compiled:
   ifaces:list[Callable] = []
@@ -375,10 +374,10 @@ class Compiled:
   var_vals: dict[str, int] = {}
 
   # hcq2
-  pm_batch:Any = None
   pm_encode:Any = None
   pm_lower:Any = None
-  pm_bufferize:Any = None # one for all devices: each adds the rules of the placeholders it owns, its tags start with its name
+  pm_link:Any = None
+  link_bufs:dict[str, Any] = {}
 
   def __init__(self, device:str, allocator:Allocator, renderers:list[type[Renderer]], runtime:type[Program[Self]]|None, arch=None):
     from tinygrad.renderer import Renderer
@@ -395,7 +394,7 @@ class Compiled:
   def has_copy_queue(self) -> bool: return True
 
   @property
-  def host(self) -> str: return f"CPU:{self.peer_group[7:]}" if self.peer_group.startswith("remote:") else HCQ_RUNTIME_DEV.value
+  def host(self) -> str: return f"CPU:{self.peer_group[7:]}" if self.peer_group.startswith("remote:") else HCQ_RUNTIME_DEV.device
 
   @property
   def renderer(self) -> Renderer: return self._select_renderer()
@@ -412,7 +411,7 @@ class Compiled:
   def rt_buffer(self, spec:BufferSpec) -> Buffer:
     return Buffer(self.device, self.rt_allocator(spec).size, options=spec, preallocate=True)
 
-  def tag(self, *parts:str) -> str: return to_name(self.device, *parts) # of the placeholders it owns
+  def link_buffer(self, b:UOp) -> Buffer|None: return None
 
   @functools.cached_property
   def timeline(self) -> Buffer: # [the signal, the value the last submitted batch signals]
@@ -463,10 +462,10 @@ class Compiled:
   def _renderer_name(self, r:type[Renderer]) -> str:
     return r.__name__.upper().removesuffix("RENDERER").removeprefix(devname:=self.device.split(':')[0].upper()) or devname
 
-  def _select_renderer(self) -> Renderer:
+  def _select_renderer(self, cv=DEV) -> Renderer:
     assert (rn:=next((self._renderer_name(r) for r in self.renderers if getenv(f"{self.device}_{self._renderer_name(r)}")), None)) is None, \
       f"{self.device}_{rn}=1 is deprecated, use DEV={self.device}:{rn} instead"
-    t = DEV.target(self.device.split(':')[0], **({"arch":self.arch} if self.arch else {}))
+    t = cv.target(self.device.split(':')[0], **({"arch":self.arch} if self.arch else {}))
     return select_first_inited(select_by_name(self.renderers, self._renderer_name, t.renderer, f"{self.device} has no renderer {t.renderer!r}"),
                                f"No renderer for {self.device} is available", self.cached_renderer, t)
 
@@ -483,14 +482,13 @@ class Compiled:
   # profiling
 
   def collect_prof(self):
-    if PROFILE:
-      es = list(self.prof_ents.items())
-      sigs = [buf.host.view(fmt='Q')[i]/decimal.Decimal(self.timestamp_divider) for (buf, _), e in es for i in (e.st_id, e.en_id)]
-      Compiled.profile_events.append(ProfileGraphEvent([replace(e, st_id=2*i, en_id=2*i+1) for i,(_, e) in enumerate(es)], [], sigs))
+    div = decimal.Decimal(self.timestamp_divider)
+    for buf, g in itertools.groupby(self.prof_ents.items(), key=lambda x: x[0][0]) if PROFILE else []:
+      Compiled.profile_events.append(ProfileGraphEvent([e for _, e in g], [], [t/div for t in buf.host.view(fmt='Q')[:]]))
     self.prof_ents.clear()
 
   def _at_profile_finalize(self):
-    if not self.pm_encode.patterns: return
+    if self.device.split(":")[0] not in HCQ_DEVS: return
     from tinygrad.tensor import Tensor
     tdiffs = []
     for _ in range(5):
