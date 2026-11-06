@@ -11,16 +11,22 @@ class QCOMCompiler(Compiler):
   def __init__(self, arch:str):
     assert arch.split(',')[0] == "a630", "only a630 supported"
     if platform.machine() == "aarch64": self.arch, self.chip_id, self.llvm_inst = arch, 0x6030001, llvm_qcom.cl_compiler_create_llvm_instance()
-    else:
-      # extract once into the download cache, all processes share the rootfs (extract=True)
-      self.arch, self.chip_id = arch, 0x6030001
-      fs, root = fetch('https://git.tinygrad.win/tinygrad/images/releases/download/v2/qcomcl.tar.gz', extract=True), pathlib.Path(__file__).parents[3]
-      self.compiler_process = self.server(f"{qemu} -cpu max,pauth=off -L {fs} {fs}/usr/bin/python3" if (qemu:=shutil.which("qemu-aarch64-static"))
-                                          else (f"docker run --rm -i --platform linux/aarch64 -v {fs}/usr:/usr -v {root}:{root} "
-                                                f"-e PYTHONPATH={root} -e QEMU_CPU=max,pauth=off gcr.io/distroless/static python3"), arch)
+    else: self.arch, self.chip_id, self._process = arch, 0x6030001, None  # the compile server starts on first compile, replaying binaries needs none
     super().__init__(f"compile_qcomcl_{arch}")
 
-  def __del__(self): llvm_qcom.cl_compiler_destroy_llvm_instance(self.llvm_inst) if platform.machine() == "aarch64" else self.compiler_process.kill()
+  @property
+  def compiler_process(self):
+    if self._process is None:
+      # extract once into the download cache, all processes share the rootfs (extract=True)
+      fs, root = fetch('https://git.tinygrad.win/tinygrad/images/releases/download/v2/qcomcl.tar.gz', extract=True), pathlib.Path(__file__).parents[3]
+      self._process = self.server(f"{qemu} -cpu max,pauth=off -L {fs} {fs}/usr/bin/python3" if (qemu:=shutil.which("qemu-aarch64-static"))
+                                  else (f"docker run --rm -i --platform linux/aarch64 -v {fs}/usr:/usr -v {root}:{root} "
+                                        f"-e PYTHONPATH={root} -e QEMU_CPU=max,pauth=off gcr.io/distroless/static python3"), self.arch)
+    return self._process
+
+  def __del__(self):
+    if platform.machine() == "aarch64": llvm_qcom.cl_compiler_destroy_llvm_instance(self.llvm_inst)
+    elif self._process is not None: self._process.kill()
 
   def __reduce__(self): return QCOMCompiler, (self.arch,)
 
