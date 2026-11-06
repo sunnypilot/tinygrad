@@ -1005,11 +1005,48 @@ def _hw_div_fmas_scaled(a:UOp, b:UOp, c:UOp) -> UOp:  # fma scaled by 2^+-64 (f3
   if c.dtype == dtypes.float64:  # an fma that overflows before a down-scale is redone with the scale folded into a and c
     big_a = a.abs() >= b.abs()  # scale the larger factor so it stays exact
     f = _hw_fma(a, b, c)
-    r1, r2 = f * sc, _hw_fma(big_a.where(a * sc, a), big_a.where(b, b * sc), c * sc)
+    a2, b2 = big_a.where(a * sc, a), big_a.where(b, b * sc)
+    r1 = f * sc
+    def split(x:UOp) -> tuple[UOp, UOp]:
+      hi = (x.bitcast(dtypes.uint64) & _c(0xFFFFFFFFF8000000, dtypes.uint64)).bitcast(_F64)
+      return hi, x - hi
+    (ah, al), (bh, bl) = split(a2), split(b2)
+    ph = a2 * b2
+    pl, cs = ((ah * bh - ph) + ah * bl + al * bh) + al * bl, c * sc
+    s1 = ph + cs
+    bb = s1 - ph
+    e1 = (ph - (s1 - bb)) + (cs - bb)
+    lo = pl + e1
+    bl = lo - pl
+    el = (pl - (lo - bl)) + (e1 - bl)
+    el = el.ne(_c(0.0, _F64)).where(el, c - cs / sc)
+    r2, r3 = _hw_fma(a2, b2, cs), s1 + _rto64(lo, el)
+    (ah, al), (bh, bl) = split(a), split(b)  # a denormal result: the exact unscaled a*b + c rounded to odd, so the scale rounds once
+    qh = (a * (b * _c(2.0, _F64))) * _c(0.5, _F64)  # fl(a*b) without an a*b node: one shared with the plain fma would stop it fusing
+    ql = ((ah * bh - qh) + ah * bl + al * bh) + al * bl
+    t1 = qh + c
+    tb = t1 - qh
+    te = (qh - (t1 - tb)) + (c - tb)
+    tl = ql + te
+    tlb = tl - ql
+    tle = (ql - (tl - tlb)) + (te - tlb)
+    t2 = t1 + tl
+    t2b = t2 - t1
+    ok = (qh.abs() >= _c(2.0 ** -960, _F64)) & (qh.abs() < _c(2.0 ** 1000, _F64)) & (c.abs() < _c(2.0 ** 1000, _F64)) & \
+         (a.abs() >= _c(2.0 ** -940, _F64)) & (b.abs() >= _c(2.0 ** -940, _F64))  # every partial product of the split stays exact
+    err = ((t1 - (t2 - t2b)) + (tl - t2b)) + tle
+    u64 = dtypes.uint64
+    mb, neg_ = t2.abs().bitcast(u64), t2 < _c(0.0, _F64)
+    em = neg_.where(-err, err)  # > 0: the true magnitude is above |t2|
+    m53 = (mb & _c((1 << 52) - 1, u64)) | _c(1 << 52, u64)
+    q = m53 >> _c(1, u64)  # |t2| * 2^-128 just under 2^-1022 keeps 52 bits: round the one dropped bit by hand (round to odd needs two)
+    up1 = (m53 & _c(1, u64)).ne(_c(0, u64)) & ((em > _c(0.0, _F64)) | (em.eq(_c(0.0, _F64)) & (q & _c(1, u64)).ne(_c(0, u64))))
+    d52 = ((q + up1.cast(u64)) | neg_.where(_c(1 << 63, u64), _c(0, u64))).bitcast(_F64)
+    r2 = ok.where(((mb >> _c(52, u64)).eq(_c(128, u64)) & ~up).where(d52, _rto64(t2, err) * sc), r2)
     over = r1.abs().eq(_c(float('inf'), _F64)) & a.abs().ne(_c(float('inf'), _F64)) & b.abs().ne(_c(float('inf'), _F64)) & \
            c.abs().ne(_c(float('inf'), _F64))
     tiny = (r1.abs() < _c(2.0 ** -1022, _F64)) & f.ne(_c(0.0, _F64))    # a denormal result rounds once from the folded form
-    return (((over & ~up) | tiny) & r2.ne(_c(0.0, _F64)) & r2.eq(r2)).where(r2, r1)
+    return ((over & ~up) & r3.ne(_c(0.0, _F64)) & r3.eq(r3)).where(r3, (tiny & r2.ne(_c(0.0, _F64)) & r2.eq(r2)).where(r2, r1))
   p, cc = a.cast(_F64) * b.cast(_F64), c.cast(_F64)    # exact product; two-sum keeps the sum exact, rounding to odd makes the f32 rounding single
   s_ = p + cc
   bb = s_ - p
@@ -1292,6 +1329,7 @@ def _hw_qsad(a:UOp, b:UOp, c:UOp, clmp:UOp, masked:bool) -> UOp:
     acc = (clmp.cast(u64).ne(_c(0, u64)) & (acc > _c(0xFFFF, u64))).where(_c(0xFFFF, u64), acc)
     out = out | ((acc & _c(0xFFFF, u64)) << _c(16 * j, u64))
   return out
+_FUNCS['hw_trig_preop'] = lambda sh: _pcode._trig_preop(sh, low=18)  # gfx1200 keeps 2/pi down to bit 18 of the 1201
 _FUNCS['hw_mqsad'] = lambda a, b, c, clmp: _hw_qsad(a, b, c, clmp, True)
 _FUNCS['hw_qsad'] = lambda a, b, c, clmp: _hw_qsad(a, b, c, clmp, False)
 _HW_PCODE.update({'V_MQSAD_PK_U16_U8': 'D0.b64 = hw_mqsad(S0.b64, S1.u32, S2.b64, CLMP)',
@@ -1299,6 +1337,7 @@ _HW_PCODE.update({'V_MQSAD_PK_U16_U8': 'D0.b64 = hw_mqsad(S0.b64, S1.u32, S2.b64
                   'V_RCP_IFLAG_F32': 'D0.f32 = hw_rcp(S0.f32)',
                   'V_TRIG_PREOP_F64': _get_pcode_isa(ir4.VOP3Op.V_TRIG_PREOP_F64).replace('D0.f64 = ldexp(result, scale)',
                                                                                           'D0.f64 = hw_ldexp(result, scale)')
+                                                                                          .replace('trig_preop_result(shift)', 'hw_trig_preop(shift)')
 })
 def _div_scale_fields(x:UOp) -> tuple[UOp, int, int]:
   ut, mb = (dtypes.uint64, 52) if x.dtype == _F64 else (dtypes.uint32, 23)
@@ -1312,7 +1351,9 @@ def _hw_div_scale(s0:UOp, s1:UOp, s2:UOp) -> UOp:
   den = s0.bitcast(ut).eq(s1.bitcast(ut))
   up = s0 * _c(2.0 ** sc, s0.dtype)
   sinf = ((s0.bitcast(ut) & _c(1 << (mb + (11 if f64 else 8)), ut)) | _c((0x7FF if f64 else 0xFF) << mb, ut)).bitcast(s0.dtype)
-  dn = ((e0 <= _c(sc, i32)) & s0.ne(_c(0.0, s0.dtype))).where(sinf, s0 * _c(2.0 ** -sc, s0.dtype))
+  emax = _c(0x7FF if f64 else 0xFF, i32)  # f64 with an inf / NaN s1: a small s0 saturates only up to exponent 116 (measured)
+  thr = e1.eq(emax).where(_c(116, i32), _c(sc, i32)) if f64 else _c(sc, i32)
+  dn = ((e0 <= thr) & s0.ne(_c(0.0, s0.dtype))).where(sinf, s0 * _c(2.0 ** -sc, s0.dtype))
   r = (e2 <= _c(tiny, i32)).where(up, s0)
   r = (d <= _c(-lim, i32)).where(den.where(s0, up), r)
   r = (e1 >= _c(big, i32)).where((den | (d > _c(-lim, i32))).where(dn, s0), r)
@@ -1376,11 +1417,27 @@ HW_FLOAT_MODE = 0xF0
 _FLOAT_OP = re.compile(r"_(f16|f32|f64|bf16|fp8|bf8)\b|_(f16|f32|f64|bf16)_|wmma|swmmac|_dot\d|_pk_")
 _SIG_FIELDS = ("clmp", "omod", "abs", "neg", "neg_hi", "opsel", "opsel_hi", "opsel_hi2")
 @functools.cache
-def hw_verified() -> frozenset[str]:
+def _hw_sigs() -> tuple[frozenset[str], dict[str, dict[str, int]]]:
   with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfx1200_verified.sigs")) as f:
-    return frozenset(l.strip() for l in f if l.strip() and not l.startswith("#"))
-def inst_signature(inst) -> str:
-  return "|".join([inst.op_name.lower()] + [f"{f}={getattr(inst, f)}" for f in _SIG_FIELDS if getattr(inst, f, 0)])
+    lines = [l.strip() for l in f if l.strip() and not l.startswith("#")]
+  bases = {(b:=l.split(" ", 1)[1]).split("|")[0]: _sig_fields(b) for l in lines if l.startswith("fields ")}
+  return frozenset(l for l in lines if not l.startswith("fields ")), bases
+def hw_verified() -> frozenset[str]: return _hw_sigs()[0]
+def _sig_fields(sig:str) -> dict[str, int]: return {k: int(v) for k, v in (f.split("=") for f in sig.split("|")[1:])}
+def _make_sig(op:str, fields:dict[str, int]) -> str: return "|".join([op] + [f"{f}={fields[f]}" for f in _SIG_FIELDS if fields.get(f, 0)])
+_BIT_FIELDS = ("abs", "neg", "neg_hi", "opsel")
+def sig_verified(sig:str) -> bool:
+  verified, bases = _hw_sigs()
+  if sig in verified: return True
+  op, fields = sig.split("|")[0], _sig_fields(sig)
+  if (base := bases.get(op)) is None: return False
+  atoms = []
+  for f in _SIG_FIELDS:
+    q, b = fields.get(f, 0), base.get(f, 0)
+    if q == b: continue
+    atoms += [{**base, f: b ^ bit} for bit in (1 << i for i in range(8)) if (q ^ b) & bit] if f in _BIT_FIELDS else [{**base, f: q}]
+  return all(_make_sig(op, a) in verified for a in atoms)
+def inst_signature(inst) -> str: return _make_sig(inst.op_name.lower(), {f: getattr(inst, f, 0) or 0 for f in _SIG_FIELDS})
 def hw_unverified(elf:bytes) -> dict[str, int]:
   out:dict[str, int] = {}
   mode = (int.from_bytes(get_elf_section(elf, ".rodata").content[48:52], "little") >> 12) & 0xFF
@@ -1391,7 +1448,7 @@ def hw_unverified(elf:bytes) -> dict[str, int]:
     elif hasattr(inst, "op_name"): sigs = [inst_signature(inst)]
     else: continue
     for sig in sigs:
-      if _FLOAT_OP.search(sig.split("|")[0]) and sig not in hw_verified(): out[sig] = out.get(sig, 0) + 1
+      if _FLOAT_OP.search(sig.split("|")[0]) and not sig_verified(sig): out[sig] = out.get(sig, 0) + 1
   return out
 
 def _compile_sopp(inst: ir3.SOPP | ir4.SOPP, ctx: _Ctx) -> UOp:
@@ -2766,9 +2823,14 @@ _COMMON_HANDLERS: list[tuple[Callable[..., UOp], tuple[str, ...]]] = [
   (_compile_mem_op, ('DS', 'FLAT', 'GLOBAL', 'SCRATCH', 'VFLAT', 'VGLOBAL', 'VSCRATCH')),
 ]
 _INST_HANDLERS: dict[type, Callable[..., UOp]] = {t: h for h, names in _COMMON_HANDLERS for t in _inst_kinds(*names)}
+_IR4_TYPES = (ir4.VOP1, ir4.VOP2, ir4.VOPC, ir4.VOP3, ir4.VOP3SD, ir4.VOP3P)
 _INST_HANDLERS[irc.MUBUF] = _compile_mubuf  # CDNA only (rdna3 also has a MUBUF class, intentionally unhandled)
 
 def _get_handler(inst: Inst) -> Callable[..., UOp]:
+  if isinstance(inst, _IR4_TYPES) and (hasattr(type(inst), 'vsrc0') or getattr(getattr(inst, 'src0', None), 'offset', 0) in (233, 234, 250)) and \
+     any(bits == 64 and fmt.name != 'FMT_NUM_M64' for fmt, bits, _ in inst.canonical_operands.values()):
+    # llvm rejects dpp on any 64-bit operand for gfx12 ("dpp variant of this instruction is not supported") and the chip hangs on it
+    raise RuntimeError(f"{_op_name(inst)} with dpp: 64-bit operands have no dpp form on rdna4 (illegal encoding; the gpu hangs)")
   # Look up handler by type, falling back to base classes for _LIT variants
   handler = _INST_HANDLERS.get(type(inst))
   if handler is not None: return handler

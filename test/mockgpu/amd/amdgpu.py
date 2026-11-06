@@ -30,6 +30,18 @@ regGUS_PERFCOUNTER_HI = 0x3643 + amd_gpu.GC_BASE__INST0_SEG1
 regSQ_THREAD_TRACE_BUF0_BASE_LO = 0x39e7 + amd_gpu.GC_BASE__INST0_SEG1
 regSQ_THREAD_TRACE_BUF0_BASE_HI = regSQ_THREAD_TRACE_BUF0_BASE
 
+S_CODE_END = 0xBF9F0000
+def _text_size(addr:int, limit:int) -> int:
+  import numpy as np
+  for chunk in (1 << 16, 1 << 20, limit):  # kernels are short: look near the entry first
+    words = np.frombuffer(to_mv(addr, min(chunk, limit) & ~3), np.uint32)
+    hits = np.flatnonzero(words == S_CODE_END)
+    if hits.size:
+      rest = np.flatnonzero(words[hits[0]:] != S_CODE_END)
+      return int(hits[0] + (rest[0] if rest.size else len(words) - hits[0])) * 4
+    if chunk >= limit: break
+  return 0
+
 class SQTT_EVENTS:
   THREAD_TRACE_FINISH = 0x00000037
 
@@ -207,10 +219,12 @@ class PM4Executor(AMDQueue):
     wavesize = (tmpring_size >> 12) & 0x3FFF  # WAVESIZE field is bits 12:25
     scratch_size = wavesize * (16 if self.gpu.arch == "cdna" else 4)  # per-thread scratch size in bytes
 
-    assert 0 < self.kernel_text_size <= prg_sz, "Invalid prg ptr or text size"
+    text_size, self.kernel_text_size = self.kernel_text_size or _text_size(prg_addr, prg_sz), 0
+    assert 0 < text_size <= prg_sz, "Invalid prg ptr or text size"
     from test.mockgpu.amd.emu import run_asm
-    err = run_asm(prg_addr, self.kernel_text_size, gl[0], gl[1], gl[2], lc[0], lc[1], lc[2], args_addr,
-                  rsrc2, scratch_size, self.gpu.arch, self.kernel_name)
+    err = run_asm(prg_addr, text_size, gl[0], gl[1], gl[2], lc[0], lc[1], lc[2], args_addr,
+                  rsrc2, scratch_size, self.gpu.arch, self.kernel_name or f"kernel_{prg_addr:x}")
+    self.kernel_name = ""
     if err != 0: raise RuntimeError("remu does not support the new instruction introduced in this kernel")
 
   def _exec_indirect_buffer(self, n):

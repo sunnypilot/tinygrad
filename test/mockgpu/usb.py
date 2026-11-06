@@ -1,5 +1,5 @@
 from __future__ import annotations
-import ctypes, mmap, struct
+import ctypes, mmap, struct, traceback
 from typing import Any, Callable
 from tinygrad.runtime.autogen import libusb, libc
 
@@ -216,15 +216,31 @@ class MockUSB3:
     return memoryview(data)
 
 # the host program calls libusb through function pointers: mock the calls the copies make, the transfers complete synchronously
+LIBUSB_ERROR_IO, LIBUSB_TRANSFER_ERROR = -1, 1
+def _faults(fail):
+  def deco(fn):
+    def wrapper(*args):
+      try: return fn(*args)
+      except Exception:
+        traceback.print_exc()
+        return fail(*args)
+    return wrapper
+  return deco
+@_faults(lambda *a: LIBUSB_ERROR_IO)
 def _control(h, rtype, req, val, idx, data, n, timeout):
   if rtype & 0x80: ctypes.memmove(data, bytes(MockUSB3.inst.control_read(req, n, val, idx)), n)
   else: MockUSB3.inst.control_write(req, val, idx, ctypes.string_at(data, n))
   return n
+@_faults(lambda *a: LIBUSB_ERROR_IO)
 def _bulk(h, ep, data, n, actual, timeout):
   if ep & 0x80: ctypes.memmove(data, bytes(MockUSB3.inst.bulk_read(n)), n)
   else: MockUSB3.inst.bulk_write(ctypes.string_at(data, n))
   if actual: actual[0] = n
   return 0
+def _submit_fail(t):
+  t.contents.status = LIBUSB_TRANSFER_ERROR
+  return 0
+@_faults(_submit_fail)
 def _submit(t):
   MockUSB3.inst.bulk_write(ctypes.string_at(t.contents.buffer, t.contents.length))
   t.contents.status = 0

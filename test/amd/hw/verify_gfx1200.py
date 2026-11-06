@@ -47,6 +47,18 @@ def dir_results(hw_dir, emu_dir, res, key_of):
     ok = b is not None and "error" not in b.files and int(a["inhash"]) == int(b["inhash"]) and _same(a["out"], b["out"])
     res[key_of(os.path.basename(f)[:-4], a)].append(ok)
 
+def field_ops(folded:dict[str, list[bool]], bases:set[str]) -> list[str]:
+  by_op: dict[str, list[str]] = collections.defaultdict(list)
+  for k in folded: by_op[k.split("|")[0]].append(k)
+  out = []
+  for op, keys in sorted(by_op.items()):
+    base = [k for k in keys if k in bases]
+    if len(base) != 1 or not all(all(folded[k]) and folded[k] for k in keys): continue
+    bf = dict(f.split("=") for f in base[0].split("|")[1:])
+    multi = sum(1 for k in keys if len(set(dict(f.split("=") for f in k.split("|")[1:]).items()) ^ set(bf.items())) >= 3)
+    if multi: out.append(base[0])
+  return out
+
 def verify(hw:str, emu_root:str):
   res: dict[str, list[bool]] = collections.defaultdict(list)
   a, b = np.load(os.path.join(hw, "rounding.npz")), np.load(os.path.join(emu_root, "rounding.npz"))
@@ -54,16 +66,20 @@ def verify(hw:str, emu_root:str):
     sig = next((s for p, s in ROUNDING.items() if k == p or k.startswith(p + "_")), None)
     if sig is not None: res[sig].append(k in b.files and _same(a[k], b[k]))
   for d in (*PASSES, "sigs"): dir_results(os.path.join(hw, d), os.path.join(emu_root, d), res, lambda name, _: name.replace("+", "|"))
+  base_names = {os.path.basename(f)[:-4].replace("+", "|") for f in glob.glob(os.path.join(hw, "all", "*.npz"))}
   dir_results(os.path.join(hw, "mat"), os.path.join(emu_root, "mat"), res, lambda name, a: str(a["sig"]))
   folded: dict[str, list[bool]] = collections.defaultdict(list)
   for k, oks in res.items(): folded[k.rsplit("|", 1)[0] if k.endswith(FOLD) else k] += oks
   ok = sorted(s for s, oks in folded.items() if oks and all(oks))
   bad = sorted(s for s, oks in folded.items() if not all(oks))
+  fields = field_ops(folded, {k.rsplit("|", 1)[0] if k.endswith(FOLD) else k for k in base_names})
   out = os.path.join(here, "..", "..", "mockgpu", "amd", "gfx1200_verified.sigs")
   with open(out, "w") as f:
     f.write("# rdna4 instruction signatures the amd emulator reproduces bit for bit on a gfx1200 gpu; written by test/amd/hw/verify_gfx1200.py\n")
     f.write("".join(s + "\n" for s in ok))
-  print(f"{len(ok)} verified signatures -> {os.path.normpath(out)}; {len(bad)} not verified")
+    f.write("# ops whose every probed combination matched: any combination of individually verified fields is accepted (base form after it)\n")
+    f.write("".join(f"fields {b}\n" for b in fields))
+  print(f"{len(ok)} verified signatures, {len(fields)} per-field ops -> {os.path.normpath(out)}; {len(bad)} not verified")
   return bad
 
 if __name__ == "__main__":

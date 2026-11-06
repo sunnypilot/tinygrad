@@ -318,7 +318,7 @@ TWO_OVER_PI = int(
   "da3eda6cfd9e4f96136e9e8c7ecd3cbfd45aea4f758fd7cbe2f67a0e73ef14a525d4d7f6bf623f1aba10ac06608df8f6", 16)
 # TWO_OVER_PI as 19 u64 words for trig_preop_result (word[0] = bits 0-63, word[18] = bits 1152-1200)
 _PREOP_WORDS = tuple((TWO_OVER_PI >> (64 * i)) & 0xFFFFFFFFFFFFFFFF for i in range(19))
-def _trig_preop(val: UOp) -> UOp:
+def _trig_preop(val: UOp, low: int = 0) -> UOp:
   # Extract 53 bits from position (1148 - shift) in the 1201-bit 2/PI constant
   # Using word-based selection: 19 conditions instead of 1149
   shift = val.cast(dtypes.uint32)
@@ -326,14 +326,18 @@ def _trig_preop(val: UOp) -> UOp:
   word_idx = bit_pos >> _u32(6)  # // 64
   bit_off = bit_pos & _u32(63)   # % 64
   # Select lo_word and hi_word using shared conditions
-  lo_word, hi_word = _u64(_PREOP_WORDS[18]), _u64(0)
+  words = [_PREOP_WORDS[0] & ~((1 << low) - 1) & 0xFFFFFFFFFFFFFFFF, *_PREOP_WORDS[1:]]
+  lo_word, hi_word = _u64(words[18]), _u64(0)
   for i in range(17, -1, -1):
     cond = word_idx.eq(_u32(i))
-    lo_word = cond.where(_u64(_PREOP_WORDS[i]), lo_word)
-    hi_word = cond.where(_u64(_PREOP_WORDS[i + 1]), hi_word)
+    lo_word = cond.where(_u64(words[i]), lo_word)
+    hi_word = cond.where(_u64(words[i + 1]), hi_word)
   # Combine and extract 53 bits: ((lo >> bit_off) | (hi << (64 - bit_off))) & mask
   bit_off_64 = bit_off.cast(dtypes.uint64)
   result = ((lo_word >> bit_off_64) | (hi_word << (_u64(64) - bit_off_64))) & _u64(0x1fffffffffffff)
+  past = shift > _u32(1148)  # the window runs off b_0: zeros come in below it
+  tail = _u64(words[0]) << past.where(shift - _u32(1148), _u32(0)).cast(dtypes.uint64)
+  result = past.where((shift < _u32(1201)).where(tail & _u64(0x1fffffffffffff), _u64(0)), result)
   return result.cast(dtypes.float64)
 
 def _ff1(val: UOp, bits: int) -> UOp:

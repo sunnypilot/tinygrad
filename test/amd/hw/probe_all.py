@@ -235,6 +235,7 @@ def _variant(inst, **fields):
   for k, val in fields.items(): setattr(out, k, val)
   return out
 
+COMBOS = 12
 def mod_cases() -> list[tuple[str, list, dict, bool]]:
   out, seen = [], set()
   for sig, body, spec, _ in cases():
@@ -265,8 +266,8 @@ def mod_cases() -> list[tuple[str, list, dict, bool]]:
         for k, val in d.items(): masks[k] = masks.get(k, 0) | val
       masks.update({k: 3 for k in ("omod", "opsel_hi") if k in masks})
       if "opsel_hi2" in masks: masks["opsel_hi2"] = 1
-      u = hashes(sig, 77, 4)
-      for j in range(4): singles.append({k: int(_f(u[j:j+1], 6 * i, 6)[0]) & m for i, (k, m) in enumerate(masks.items())})
+      u = hashes(sig, 77, COMBOS)  # random multi-field combinations: the per-field gate trusts an op only if all of these match too
+      for j in range(COMBOS): singles.append({k: int(_f(u[j:j+1], 6 * i, 6)[0]) & m for i, (k, m) in enumerate(masks.items())})
     for fields in singles:
       try: var = _variant(inst, **fields)
       except Exception: continue
