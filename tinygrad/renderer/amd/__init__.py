@@ -4,7 +4,7 @@ from tinygrad.renderer.amd.dsl import Inst, FixedBitField, EnumBitField
 
 # SDWA/DPP variant detection: src0 field (bits 0-8) encodes the variant
 # 0xf9 (249) = SDWA, 0xfa (250) = DPP16 for CDNA (GFX9)
-_VARIANT_SRC0 = {"_SDWA_SDST": 0xf9, "_SDWA": 0xf9, "_DPP16": 0xfa}
+_VARIANT_SRC0 = {"_SDWA_SDST": (0xf9,), "_SDWA": (0xf9,), "_DPP16": (0xfa,), "_DPP8": (0xe9, 0xea)}
 
 def _matches(data: bytes|memoryview, cls: type[Inst]) -> bool:
   """Check if data matches all FixedBitFields and op is in allowed."""
@@ -19,11 +19,13 @@ def _matches(data: bytes|memoryview, cls: type[Inst]) -> bool:
       try: opcode = field.decode((word >> field_lo) & field.mask)
       except ValueError: return False  # opcode not in enum
       if opcode not in field.allowed: return False
-  # Check SDWA/DPP variant based on src0 field (bits 0-8) - only for variant classes
+  # SDWA/DPP variants are told apart by their src0 marker, read where the format keeps src0 (bits 0-8, or 32-40 for VOP3-style)
   name = cls.__name__
-  word = int.from_bytes(data[:4], 'little')
   for suffix, expected_src0 in _VARIANT_SRC0.items():
-    if name.endswith(suffix): return (word & 0x1ff) == expected_src0
+    if name.endswith(suffix):
+      lo = cls.src0.lo if hasattr(cls, 'src0') else 0
+      word = int.from_bytes(data[(lo // 32) * 4:(lo // 32) * 4 + 4], 'little')
+      return ((word >> (lo % 32)) & 0x1ff) in expected_src0
   return True
 
 # Lazy-load instruction format tables to avoid circular imports (ins.py imports dsl.py which is in this package)
@@ -41,7 +43,9 @@ def _load_formats() -> dict[str, list[type[Inst]]]:
     VOPD as R4_VOPD, VINTERP as R4_VINTERP, SOP1 as R4_SOP1, SOP1_LIT as R4_SOP1_LIT,
     SOP2 as R4_SOP2, SOP2_LIT as R4_SOP2_LIT, SOPC as R4_SOPC, SOPC_LIT as R4_SOPC_LIT,
     SOPK as R4_SOPK, SOPK_LIT as R4_SOPK_LIT, SOPP as R4_SOPP,
-    SMEM as R4_SMEM, DS as R4_DS, VFLAT as R4_FLAT, VGLOBAL as R4_GLOBAL, VSCRATCH as R4_SCRATCH)
+    SMEM as R4_SMEM, DS as R4_DS, VFLAT as R4_FLAT, VGLOBAL as R4_GLOBAL, VSCRATCH as R4_SCRATCH,
+    VOP1_DPP8 as R4_VOP1_DPP8, VOP2_DPP8 as R4_VOP2_DPP8, VOPC_DPP8 as R4_VOPC_DPP8, VOP3_DPP16 as R4_VOP3_DPP16, VOP3_DPP8 as R4_VOP3_DPP8,
+    VOP3P_DPP16 as R4_VOP3P_DPP16, VOP3P_DPP8 as R4_VOP3P_DPP8, VOP3SD_DPP16 as R4_VOP3SD_DPP16, VOP3SD_DPP8 as R4_VOP3SD_DPP8)
   from tinygrad.runtime.autogen.amd.cdna.ins import (VOP1 as C_VOP1, VOP1_SDWA as C_VOP1_SDWA, VOP1_DPP16 as C_VOP1_DPP16,
     VOP2 as C_VOP2, VOP2_LIT as C_VOP2_LIT, VOP2_SDWA as C_VOP2_SDWA, VOP2_DPP16 as C_VOP2_DPP16,
     VOPC as C_VOPC, VOPC_SDWA_SDST as C_VOPC_SDWA_SDST,
@@ -54,9 +58,10 @@ def _load_formats() -> dict[str, list[type[Inst]]]:
     "rdna3": [VOPD, VOP3P, VINTERP, VOP3SD, VOP3_SDST, VOP3, DS, GLOBAL, SCRATCH, FLAT, SMEM,
               SOP1, SOP1_LIT, SOP2, SOP2_LIT, SOPC, SOPK, SOPK_LIT, SOPP, VOPC_DPP16, VOPC, VOP1_SDST, VOP1_DPP16, VOP1, VOP1_LIT,
               VOP2_DPP16, VOP2, VOP2_LIT],
-    "rdna4": [R4_VOPD, R4_VOP3P, R4_VINTERP, R4_VOP3SD, R4_VOP3_SDST, R4_VOP3, R4_DS, R4_GLOBAL, R4_SCRATCH, R4_FLAT, R4_SMEM,
-              R4_SOP1, R4_SOP1_LIT, R4_SOPC, R4_SOPC_LIT, R4_SOPP, R4_SOPK, R4_SOPK_LIT, R4_VOPC_DPP16, R4_VOPC, R4_VOP1_SDST,
-              R4_VOP1_DPP16, R4_VOP1, R4_VOP1_LIT, R4_SOP2, R4_SOP2_LIT, R4_VOP2_DPP16, R4_VOP2, R4_VOP2_LIT],
+    "rdna4": [R4_VOPD, R4_VOP3P_DPP16, R4_VOP3P_DPP8, R4_VOP3P, R4_VINTERP, R4_VOP3SD_DPP16, R4_VOP3SD_DPP8, R4_VOP3SD, R4_VOP3_SDST,
+              R4_VOP3_DPP16, R4_VOP3_DPP8, R4_VOP3, R4_DS, R4_GLOBAL, R4_SCRATCH, R4_FLAT, R4_SMEM,
+              R4_SOP1, R4_SOP1_LIT, R4_SOPC, R4_SOPC_LIT, R4_SOPP, R4_SOPK, R4_SOPK_LIT, R4_VOPC_DPP16, R4_VOPC_DPP8, R4_VOPC, R4_VOP1_SDST,
+              R4_VOP1_DPP16, R4_VOP1_DPP8, R4_VOP1, R4_VOP1_LIT, R4_SOP2, R4_SOP2_LIT, R4_VOP2_DPP16, R4_VOP2_DPP8, R4_VOP2, R4_VOP2_LIT],
     "cdna": [C_VOP3PX2, C_VOP3P_MFMA, C_VOP3P, C_VOP3SD, C_VOP3_SDST, C_VOP3, C_DS, C_GLOBAL, C_SCRATCH, C_FLAT, C_MUBUF, C_SMEM,
               C_SOP1, C_SOPC, C_SOPP, C_SOPK, C_SOPK_LIT, C_VOPC_SDWA_SDST, C_VOPC,
               C_VOP1_DPP16, C_VOP1_SDWA, C_VOP1, C_VOP2_DPP16, C_VOP2_SDWA, C_SOP2, C_VOP2, C_VOP2_LIT],

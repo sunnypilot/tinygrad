@@ -6,7 +6,7 @@ from tinygrad.runtime.autogen import libc
 from tinygrad.runtime.support.amd import AMDReg, import_asic_regs
 from test.mockgpu.amd.amdgpu import AMDGPU
 
-VRAM_SIZE = 512 << 20
+VRAM_SIZE = 4 << 30
 
 def memfd(name:str) -> int:
   if hasattr(os, "memfd_create"): return os.memfd_create(name)
