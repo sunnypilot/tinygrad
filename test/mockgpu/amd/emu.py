@@ -1143,6 +1143,59 @@ def _grid_dot(a:list[UOp], b:list[UOp], c:UOp, emin:int, cmin:int) -> UOp:
   c_al = (ec < e).where(_c(0.0, _F64), _pcode._floor(cf * iq))
   terms = [_floor_sum(ps[i:i+2], q, iq) for i in range(0, len(ps), 2)]
   return (functools.reduce(lambda x, y: x + y, terms) + c_al) * q
+EMU_NATIVE = ContextVar("EMU_NATIVE", 1)
+_WMMA_C = r"""
+#include <stdint.h>
+#include <string.h>
+static inline double bd(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
+static inline uint64_t db(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
+static inline float bf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
+static inline uint32_t fb(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
+static inline int expo(float x, int emin) {
+  int e = (int)((db((double)x) >> 52) & 0x7FF) - 1023; e = e < emin ? emin : e; return x == 0.0f ? -4000 : e;
+}
+static inline double p2(int e) { return bd((uint64_t)(e + 1023) << 52); }
+static inline double fl(double x) { double t = __builtin_trunc(x); return (x < 0.0 && x != t) ? t - 1.0 : t; }
+static inline double fsum(double p0, double p1, double q, double iq) {
+  double s = p0 + p1, bb = s - p0, err = (p0 - (s - bb)) + (p1 - bb), f = fl(s * iq);
+  return (f * q == s && err < 0.0) ? f - 1.0 : f;
+}
+// t: A at [r*16+k], B at [256+n*16+k], C at [512+r*16+n] (f32 bits of f16/bf16 inputs); D -> [768+r*16+n]
+void emu_wmma_grid(uint32_t *t, int emin) {
+  float bt[16][16]; int eb[16][16];
+  for (int k = 0; k < 16; k++) for (int n = 0; n < 16; n++) { bt[k][n] = bf(t[256 + n*16 + k]); eb[k][n] = expo(bt[k][n], emin); }
+  for (int r = 0; r < 16; r++) {
+    float acc[16], a[16]; int ea[16];
+    for (int k = 0; k < 16; k++) { a[k] = bf(t[r*16 + k]); ea[k] = expo(a[k], emin); }
+    for (int n = 0; n < 16; n++) acc[n] = bf(t[512 + r*16 + n]);
+    for (int g = 0; g < 16; g += 4) {
+      for (int n = 0; n < 16; n++) {
+        double p0 = (double)a[g] * (double)bt[g][n], p1 = (double)a[g+1] * (double)bt[g+1][n];
+        double p2_ = (double)a[g+2] * (double)bt[g+2][n], p3 = (double)a[g+3] * (double)bt[g+3][n];
+        int ep = ea[g] + eb[g][n], s1 = ea[g+1] + eb[g+1][n], s2 = ea[g+2] + eb[g+2][n], s3 = ea[g+3] + eb[g+3][n];
+        ep = ep > s1 ? ep : s1; ep = ep > s2 ? ep : s2; ep = ep > s3 ? ep : s3;
+        int ec = expo(acc[n], -126);
+        int e = ep - 24; e = e > ec - 26 ? e : ec - 26; e = e > -1000 ? e : -1000;
+        double q = p2(e), iq = p2(-e);
+        double c_al = ec < e ? 0.0 : fl((double)acc[n] * iq);
+        acc[n] = (float)(((fsum(p0, p1, q, iq) + fsum(p2_, p3, q, iq)) + c_al) * q);
+      }
+    }
+    for (int n = 0; n < 16; n++) t[768 + r*16 + n] = fb(acc[n]);
+  }
+}
+"""
+@functools.cache
+def _wmma_native() -> bool:
+  if not EMU_NATIVE.value: return False
+  try:
+    so = os.path.join(tempfile.mkdtemp(), "emu_wmma.so")
+    cpu = "-march=native" if platform.machine() in ('x86_64', 'AMD64') else "-mcpu=native"
+    subprocess.check_output(['clang', '-shared', '-fPIC', '-O2', '-ffp-contract=off', '-fno-math-errno', cpu, '-x', 'c', '-', '-o', so],
+                            input=_WMMA_C.encode(), stderr=subprocess.DEVNULL)
+    from tinygrad.runtime.support.c import DLL
+    return DLL("emu_wmma", [so]).nm in DLL._loaded_
+  except Exception: return False
 def _grid_dot8(a:list[UOp], b:list[UOp], c:UOp, emin_a:int, emin_b:int) -> UOp:
   i32 = dtypes.int32
   def p2(e): return ((e.maximum(_c(-1000, i32)) + _c(1023, i32)).cast(dtypes.uint64) << _c(52, dtypes.uint64)).bitcast(_F64)
@@ -2384,8 +2437,14 @@ def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
       ctx._axis_id += 1
       return UOp.range(cnt.cast(dtypes.int), ctx._axis_id, AxisType.LOOP, dtype=dtypes.int)
     g_fast, g_full, nf = gate(ok), gate(ok.ne(True)), ctx.range(16)
-    fast = [ctx.wvgpr_dyn(vdst_reg + _c(d_map(m, nf)[1]), _c(d_map(m, 0)[0], dtypes.int) + nf,
-                          hd_acc(m, nf).bitcast(dtypes.uint32), exec_mask, after=g_fast) for m in range(16)]
+    if _wmma_native():
+      res = tmp.after(UOp.custom_function("emu_wmma_grid").call(data.after(g_fast).index(_c(0, dtypes.int)),
+                                                                _c({'F16': -14, 'BF16': -126}[a_fmt], dtypes.int32)))
+      def fast_val(m:int, n:UOp) -> UOp: return res.index(768 + m*16 + n)
+    else:
+      def fast_val(m:int, n:UOp) -> UOp: return hd_acc(m, n).bitcast(dtypes.uint32)
+    fast = [ctx.wvgpr_dyn(vdst_reg + _c(d_map(m, nf)[1]), _c(d_map(m, 0)[0], dtypes.int) + nf, fast_val(m, nf), exec_mask, after=g_fast)
+            for m in range(16)]
     full = [st.replace(src=(st.src[0].replace(src=(st.src[0].src[0].after(g_full), *st.src[0].src[1:])), *st.src[1:])) for st in stores]
     return UOp.sink(UOp.group(*fast).end(nf).end(g_fast), UOp.group(*full).end(n).end(g_full))
   return UOp.sink(UOp.group(*stores).end(n))
@@ -3172,7 +3231,7 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
     renderer = Device['CPU'].renderer
     if (key:=(code, arch, dispatch, name, type(renderer), renderer.target, *(x.value for x in to_program_config))) not in dispatch_cache:
       def build(): return to_program(lift(code, arch, renderer, dispatch, f"emu {name}"), renderer)
-      host = (platform.machine(), getattr(getattr(renderer, "compiler", None), "cachekey", None) or _host_cpu())
+      host = (platform.machine(), getattr(getattr(renderer, "compiler", None), "cachekey", None) or _host_cpu(), _wmma_native())
       dispatch_cache[key] = build() if RELIFT.value else _cached("emu_program", _cache_key(*key[:4], repr(key[4:]), HW_FLOAT.value, host), build)
       relift_lib = code
       for relift_count in range(1, RELIFT.value+1):
