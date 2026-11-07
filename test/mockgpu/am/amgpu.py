@@ -1,12 +1,19 @@
 # mypy: ignore-errors
 from __future__ import annotations
-import ctypes, struct, functools, os, mmap
+import bisect, ctypes, struct, functools, os, mmap, tempfile
 from tinygrad.runtime.autogen.am import am, smu_14_0_2
 from tinygrad.runtime.autogen import libc
 from tinygrad.runtime.support.amd import AMDReg, import_asic_regs
 from test.mockgpu.amd.amdgpu import AMDGPU
 
-VRAM_SIZE = 512 << 20
+VRAM_SIZE = 4 << 30
+
+def memfd(name:str) -> int:
+  if hasattr(os, "memfd_create"): return os.memfd_create(name)
+  # macos has no memfd_create, use an unlinked temp file
+  fd, path = tempfile.mkstemp(prefix=name)
+  os.unlink(path)
+  return fd
 
 IP_VERSIONS = {
   am.GC_HWIP: (12, 0, 0), am.SDMA0_HWIP: (7, 0, 0), am.MMHUB_HWIP: (4, 1, 0), am.NBIO_HWIP: (6, 3, 1),
@@ -38,6 +45,7 @@ class MockMMU:
   def __init__(self, gpu:MockAMGPU):
     self.gpu = gpu
     self.tlb: dict[int, tuple[int, int, bool]] = {}
+    self._vas: list[int] = []
 
   def invalidate(self, pt_base:int, va_base:int):
     new_tlb: dict[int, tuple[int, int, bool]] = {}
@@ -46,7 +54,7 @@ class MockMMU:
       old = self.tlb.get(va)
       if not is_sys and (old is None or old[0] != pa): self.gpu.map_vram_at(va, pa, sz)
       if old is None: self.gpu.map_range(va, sz)
-    self.tlb = new_tlb
+    self.tlb, self._vas = new_tlb, sorted(new_tlb)
 
   def _walk(self, pt_paddr:int, level:int, va_acc:int, out:dict, va_base:int):
     shift = [39, 30, 21, 12][level]
@@ -70,8 +78,9 @@ class MockMMU:
     sys_lo = self.gpu.mmio.regs.get(gmc.reg('regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR') or 0, 0) << 18
     sys_hi = self.gpu.mmio.regs.get(gmc.reg('regMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR') or 0, 0) << 18
     if sys_lo <= addr < sys_hi: return self.paddr_to_host(addr - self.gpu.mc_base)
-    for tva, (pa, sz, is_sys) in self.tlb.items():
-      if tva <= addr < tva + sz:
+    if (i:=bisect.bisect_right(self._vas, addr) - 1) >= 0:
+      pa, sz, is_sys = self.tlb[tva:=self._vas[i]]
+      if addr < tva + sz:
         paddr = pa + (addr - tva)
         if not is_sys: return self.gpu.vram_addr + paddr
         return self.paddr_to_host(paddr)
@@ -263,11 +272,11 @@ class MockMMIOInterface:
 class MockAMGPU(AMDGPU):
   def __init__(self, gpuid:int=0):
     super().__init__(gpuid)
-    self.vram_fd = libc.memfd_create(b"vram", libc.MFD_CLOEXEC)
+    self.vram_fd = memfd("vram")
     os.ftruncate(self.vram_fd, VRAM_SIZE)
     self.vram_addr = libc.mmap(0, VRAM_SIZE, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, self.vram_fd, 0)
     self.vram = (ctypes.c_ubyte * VRAM_SIZE).from_address(self.vram_addr)
-    self.doorbell_fd = libc.memfd_create(b"doorbell", libc.MFD_CLOEXEC)
+    self.doorbell_fd = memfd("doorbell")
     os.ftruncate(self.doorbell_fd, 0x2000)
     self.arch = "rdna4"
     self._sysmem_map:dict[int,int] = {}

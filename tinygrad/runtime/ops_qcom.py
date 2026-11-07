@@ -1,20 +1,17 @@
 from __future__ import annotations
-import os, ctypes, functools, mmap, struct, array, math, sys, contextlib
-assert sys.platform != 'win32'
+import os, ctypes, functools, mmap, struct, array, math, contextlib
 from typing import Any
 from tinygrad.device import Compiled, BufferStorage, BufferSpec, Buffer, Device, Allocator, TinyELF
 from tinygrad.runtime.support.hcq2 import HWQueue, HCQ_RUNTIME_DEV, ccall, cstruct, patch, unwrap_view, layout_args, pack_args, make_program
 from tinygrad.runtime.support.memory import MMIOInterface
-from tinygrad.runtime.support.system import FileIOInterface
+from tinygrad.runtime.support.system import FileIOInterface, System
 from tinygrad.runtime.autogen import kgsl, mesa, libc
 from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.renderer.nir import IR3Renderer
-from tinygrad.helpers import getenv, mv_address, round_up, ceildiv, prod, is_image_shape
-from tinygrad.helpers import next_power2, flatten, PROFILE, IMAGE
+from tinygrad.helpers import getenv, mv_address, round_up, ceildiv, prod, is_image_shape, next_power2, flatten, to_name, PROFILE, IMAGE
 from tinygrad.dtype import dtypes, AddrSpace
-from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, uopfunc
-from tinygrad.engine.realize import get_call_arg_uops, get_call_var_uops
-from tinygrad.runtime.support.system import System
+from tinygrad.uop.ops import Ops, UOp, UPat, PatternMatcher, KernelInfo, uopfunc
+from tinygrad.engine.realize import get_call_kernel_args
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
 
 BUFTYPE_BUF, BUFTYPE_TEX, BUFTYPE_IBO = 0, 1, 2
@@ -27,7 +24,7 @@ def dcache_flush():
   i = UOp.range(n, 0, dtype=dtypes.int)
   flush = UOp(Ops.CUSTOM, src=(buf.index(i * 64),), arg=('__asm__ volatile("dc cvac, %0" :: "r"({0}) : "memory");', dtypes.void))
   sink = UOp.sink(flush.end(i), UOp(Ops.CUSTOM, arg=('__asm__ volatile("dsb sy" ::: "memory");', dtypes.void)),
-                  arg=KernelInfo(name="dcache_flush"), tag=1)
+                  arg=KernelInfo(name="dcache_flush", opts_to_apply=()))
   prg = to_program(sink, Device["CPU"].renderer)
   return Device["CPU"].runtime(prg.to_elf())
 
@@ -67,7 +64,7 @@ class QCOMComputeQueue(HWQueue):
   def _cache_flush(self, write_back=True, invalidate=False, sync=True, memsync=False):
     # TODO: 7xx support.
     if write_back: # dirty cache write-back, into the device's dummy buffer
-      dummy = UOp.alloc((0x1000,), dtypes.uint8, 0, device=self.devs[0]).rtag(self.dev.tag("dummy"))
+      dummy = UOp.alloc((0x1000,), dtypes.uint8, 0, device=self.devs[0], name="dummy")
       self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_FLUSH_TS, dummy.getaddr(self.devs), 0)
     if invalidate: self.cmd(mesa.CP_EVENT_WRITE, mesa.CACHE_INVALIDATE) # invalidate cache lines (following reads from RAM).
     if memsync: self.cmd(mesa.CP_WAIT_MEM_WRITES)
@@ -93,27 +90,26 @@ class QCOMComputeQueue(HWQueue):
              value.cast(dtypes.uint32), qreg.cp_wait_reg_mem_4(mask=0xFFFFFFFF), qreg.cp_wait_reg_mem_5(delay_loop_cycles=32))
 
   def kernargs(self, call:UOp, prg:UOp, data:QCOMProgramData) -> UOp:
-    bufs, vals = [get_call_arg_uops(call)[g] for g in prg.arg.globals], get_call_var_uops(call, prg)
-    ubos = [bufs[slot] for _,slot,_,shape in data.signature if slot < len(bufs) and not is_image_shape(shape)]
-    uavs = [(dt,shape,bufs[slot]) for _,slot,dt,shape in data.signature if slot < len(bufs) and is_image_shape(shape)]
+    kargs = list(zip(get_call_kernel_args(call, prg, self.devs), data.signature))
+    uavs = [(dt,shape,a) for a,(_,_,dt,shape) in kargs if is_image_shape(shape)]
     # NIR can reorder images to different texture slots
-    ibos, texs = uavs[:data.ibo_cnt], [uavs[data.ibo_cnt + (data.tex_to_image[i] if data.NIR else i)] for i in range(data.tex_cnt)]
+    ibos, texs = uavs[:data.ibo_cnt], [uavs[data.tex_base + (data.tex_to_image[i] if data.NIR else i)] for i in range(data.tex_cnt)]
 
     args = [(off, UOp.const(val, dtypes.uint32 if sz == 4 else dtypes.uint16)) for val,off,sz in data.consts_info]
     args += layout_args(data.samplers, data.samp_off)
-    vals = [v.ccast(dt) for v,(_,_,dt,_) in zip(vals, data.signature[len(bufs):])]
+    ubos = [a for a,(_,_,_,shape) in kargs if not is_image_shape(shape)]
     if data.NIR:
-      args += layout_args([b.getaddr(self.devs) for b in ubos] + vals, data.buf_off)
+      args += layout_args(ubos, data.buf_off)
       if data.wgsz != 0xfc: args += layout_args(list(prg.arg.local_size), data.wgsz * 4)
-    else: args += list(zip(data.buf_offs, [b.getaddr(self.devs) for b in ubos] + vals))
+    else: args += list(zip(data.buf_offs, ubos))
 
     def _tex(b, ibo=False):
-      imgdt, shape, buf = b
+      imgdt, shape, addr = b
       pitch = shape[1] * 4 * imgdt.itemsize
       fmt = mesa.FMT6_32_32_32_32_FLOAT if imgdt.itemsize == 4 else mesa.FMT6_16_16_16_16_FLOAT
       return [qreg.a6xx_tex_const_0(fmt=fmt) if ibo else qreg.a6xx_tex_const_0(0x8, swiz_x=0, swiz_y=1, swiz_z=2, swiz_w=3, fmt=fmt),
               qreg.a6xx_tex_const_1(width=shape[1], height=shape[0]),
-              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=pitch, pitchalign=ctz(pitch)-6), 0, buf.getaddr(self.devs),
+              qreg.a6xx_tex_const_2(type=mesa.A6XX_TEX_2D, pitch=pitch, pitchalign=ctz(pitch)-6), 0, addr,
               qreg.a6xx_tex_const_6(plane_pitch=0x400000), qreg.a6xx_tex_const_7(13), 0, 0, 0, 0, 0, 0, 0, 0]
     args += layout_args(flatten(map(_tex, texs)), data.tex_off) + layout_args(flatten(map(functools.partial(_tex, ibo=True), ibos)), data.ibo_off)
     return UOp(Ops.LINEAR, src=tuple(pack_args(args, data.kernargs_alloc_size)), arg="kernargs")
@@ -129,7 +125,7 @@ class QCOMComputeQueue(HWQueue):
     global_size_mp = [cast_int(g*l) for g,l in zip(global_size, local_size)]
 
     args_addr, lib_addr = self.kernargs(call, prg, data).getaddr(self.devs), lib.getaddr(self.devs)
-    stack_addr = UOp.alloc((data.hw_stack_offset * 4,), dtypes.uint8, 0, device=self.devs[0]).rtag(self.dev.tag("stack")).getaddr(self.devs)
+    stack_addr = UOp.alloc((data.hw_stack_offset * 4,), dtypes.uint8, 0, device=self.devs[0], name="stack").getaddr(self.devs)
 
     self.cmd(mesa.CP_SET_MARKER, qreg.a6xx_cp_set_marker_0(mode=mesa.RM6_COMPUTE))
     self.reg(mesa.REG_A6XX_SP_UPDATE_CNTL, qreg.a6xx_sp_update_cntl(cs_state=True, cs_uav=True))
@@ -149,7 +145,8 @@ class QCOMComputeQueue(HWQueue):
              cast_int(global_size[0], ceil=True), cast_int(global_size[1], ceil=True), cast_int(global_size[2], ceil=True))
 
     self.reg(mesa.REG_A6XX_SP_CS_CNTL_0,
-             qreg.a6xx_sp_cs_cntl_0(threadsize=mesa.THREAD64, halfregfootprint=data.hregs, fullregfootprint=data.fregs, branchstack=data.brnchstck),
+             qreg.a6xx_sp_cs_cntl_0(threadsize=mesa.THREAD64, halfregfootprint=data.hregs, fullregfootprint=data.fregs, branchstack=data.brnchstck,
+                                    mergedregs=data.mergedregs),
              qreg.a6xx_sp_cs_cntl_1(constantrammode=mesa.CONSTLEN_256, shared_size=data.shared_size), # should this be CONSTLEN_512?
              0, data.prg_offset, lib_addr,
              qreg.a6xx_sp_cs_pvt_mem_param(memsizeperitem=data.pvtmem_size_per_item), stack_addr,
@@ -163,7 +160,7 @@ class QCOMComputeQueue(HWQueue):
 
     self.reg(mesa.REG_A6XX_SP_REG_PROG_ID_0, 0xfcfcfcfc, 0xfcfcfcfc, 0xfcfcfcfc, 0xfc, qreg.a6xx_sp_cs_const_config(constlen=1024 // 4, enabled=True))
 
-    self.reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(data.hw_stack_offset))
+    self.reg(mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET, qreg.a6xx_sp_cs_pvt_mem_stack_offset(data.hw_stack_offset >> 11))
     # image_size is in bytes, but INSTR_SIZE is measured in units of instruction groups (16 instructions, 8 bytes each)
     # https://elixir.bootlin.com/mesa/mesa-26.1.5/source/src/freedreno/ir3/ir3_shader.h#L719-L723
     self.reg(mesa.REG_A6XX_SP_CS_INSTR_SIZE, qreg.a6xx_sp_cs_instr_size(ceildiv(data.image_size, 128)))
@@ -173,7 +170,7 @@ class QCOMComputeQueue(HWQueue):
                                                                state_block=mesa.SB6_CS_TEX, num_unit=data.samp_cnt), args_addr + data.samp_off)
       self.reg(mesa.REG_A6XX_SP_CS_SAMPLER_BASE, args_addr + data.samp_off)
       self.reg(mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE,
-               UOp.alloc((0x1000,), dtypes.uint8, 0, device=self.devs[0]).rtag(self.dev.tag("border_color")).getaddr(self.devs))
+               UOp.alloc((0x1000,), dtypes.uint8, 0, device=self.devs[0], name="border_color").getaddr(self.devs))
 
     if data.tex_cnt > 0:
       self.cmd(mesa.CP_LOAD_STATE6_FRAG, qreg.cp_load_state6_0(state_type=mesa.ST_CONSTANTS, state_src=mesa.SS6_INDIRECT,
@@ -203,7 +200,7 @@ class QCOMComputeQueue(HWQueue):
     obj = cstruct(kgsl.struct_kgsl_command_object, gpuaddr=ib.getaddr(self.devs) + ib_off, size=cmdbuf.max_numel(), flags=kgsl.KGSL_CMDLIST_IB)
     req = cstruct(kgsl.struct_kgsl_gpu_command, cmdlist=obj.getaddr(HCQ_RUNTIME_DEV.device), cmdsize=ctypes.sizeof(kgsl.struct_kgsl_command_object),
                   numcmds=1, context_id=ctxid)
-    return qcom_submit(req.after(cmdbuf), UOp.alloc((1,), dtypes.int32, device=self.devs[0]).rtag("submit_ret"), fd)
+    return qcom_submit(req.after(cmdbuf), UOp.alloc((1,), dtypes.int32, device=self.devs[0], name="submit_ret"), fd)
 
 class QCOMProgramData:
   def __init__(self, dev:QCOMDevice, obj:TinyELF):
@@ -221,22 +218,23 @@ class QCOMProgramData:
 
       # see https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_shader.h#L525
       # and https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_compiler_nir.c#L5389
-      self.samp_cnt, self.tex_cnt, self.ibo_cnt = (nt:=v.image_mapping.num_tex), nt, v.num_uavs - nt
+      self.samp_cnt, self.tex_cnt, self.ibo_cnt, self.tex_base = (nt:=v.image_mapping.num_tex), nt, v.num_uavs, v.num_uavs - nt
       self.tex_to_image = v.image_mapping.tex_to_image[:]
       # IR3 outputs a sampler for every texture (https://elixir.bootlin.com/mesa/mesa-25.3.0/source/src/freedreno/ir3/ir3_compiler_nir.c#L1714)
       self.samplers = [qreg.a6xx_tex_samp_0(wrap_s=(clamp_mode:=mesa.A6XX_TEX_CLAMP_TO_BORDER), wrap_t=clamp_mode, wrap_r=clamp_mode),
                        qreg.a6xx_tex_samp_1(unnorm_coords=True, cubemapseamlessfiltoff=True), 0, 0] * self.samp_cnt
 
-      self.tex_off, self.ibo_off, self.samp_off = 2048, 2048 + 0x40 * self.tex_cnt, 2048 + 0x40 * (self.tex_cnt + self.ibo_cnt)
-      self.fregs, self.hregs = v.info.max_reg + 1, v.info.max_half_reg + 1
+      desc = max(2048, round_up(imm_off + len(imm_vals), 0x40))
+      self.tex_off, self.ibo_off, self.samp_off = desc, desc + 0x40 * self.tex_cnt, desc + 0x40 * (self.tex_cnt + self.ibo_cnt)
+      self.fregs, self.hregs, self.mergedregs = v.info.max_reg + 1, v.info.max_half_reg + 1, bool(v.mergedregs)
     else: self._parse_lib(obj.lib)
 
     self.pvtmem_size_per_item: int = round_up(self.pvtmem, 512) >> 9
-    self.pvtmem_size_total: int = self.pvtmem_size_per_item * 128 * 2
-    self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * 128 * 16, 0x1000)
+    self.pvtmem_size_total: int = self.pvtmem_size_per_item * dev.fibers_per_sp // 8
+    self.hw_stack_offset: int = round_up(next_power2(round_up(self.pvtmem, 512)) * dev.fibers_per_sp, 0x1000)
     self.shared_size: int = max(1, (self.shmem - 1) // 1024)
     self.max_threads = min(1024, ((384 * 32) // (max(1, (self.fregs + round_up(self.hregs, 2) // 2)) * 128)) * 128)
-    self.kernargs_alloc_size = round_up(2048 + (self.tex_cnt + self.ibo_cnt) * 0x40 + len(self.samplers) * 4, 0x100)
+    self.kernargs_alloc_size = round_up(min(self.tex_off, self.ibo_off) + (self.tex_cnt + self.ibo_cnt) * 0x40 + len(self.samplers) * 4, 0x100)
 
   def _parse_lib(self, lib):
     # Extract image binary
@@ -271,6 +269,7 @@ class QCOMProgramData:
 
     # Setting correct offsets to textures/ibos.
     self.tex_cnt, self.ibo_cnt = sum(typ is BUFTYPE_TEX for _,typ in binfos), sum(typ is BUFTYPE_IBO for _,typ in binfos)
+    self.tex_base = self.ibo_cnt
     self.ibo_off, self.tex_off, self.samp_off = 2048, 2048 + 0x40 * self.ibo_cnt, 2048 + 0x40 * self.tex_cnt + 0x40 * self.ibo_cnt
 
     if _read_lib(lib, 0xb0) != 0: # check if we have constants.
@@ -282,28 +281,36 @@ class QCOMProgramData:
 
     # Registers info
     reg_desc_off = _read_lib(lib, 0x34)
-    self.fregs, self.hregs = _read_lib(lib, reg_desc_off + 0x14), _read_lib(lib, reg_desc_off + 0x18)
+    self.fregs, self.hregs, self.mergedregs = _read_lib(lib, reg_desc_off + 0x14), _read_lib(lib, reg_desc_off + 0x18), False
 
 def qcom_build_program(dev:QCOMDevice, prg:UOp, devs:tuple[str, ...]) -> tuple[QCOMProgramData, UOp]:
   image = bytes((data:=QCOMProgramData(dev, prg.to_elf())).image).ljust(round_up(len(data.image), 4), b"\x00")
   return data, patch(make_program(prg, len(image), devs[0]), [], image)
 
 class QCOMAllocator(Allocator['QCOMDevice']):
+  def alloc(self, size:int, options:BufferSpec|None=None) -> BufferStorage:
+    # wait for previous GPU use before the CPU overwrites cached storage
+    if options is not None and options.cpu_access and self.cache.get((size, options)): self.dev.synchronize()
+    return super().alloc(size, options)
+
   def _alloc(self, size:int, options:BufferSpec) -> BufferStorage:
     return self.dev._gpu_map(options.external_ptr, size) if options.external_ptr else self.dev._gpu_alloc(size)
 
   def _free(self, storage:BufferStorage, options:BufferSpec):
     self.dev.synchronize()
     self.dev._gpu_free(storage)
+  def _map(self, buf:Buffer) -> BufferStorage: return self.dev._gpu_map(buf.host.addr, buf.nbytes)
+  def _unmap(self, mapping:BufferStorage): self._free(mapping, BufferSpec())
   def _offset(self, buf:int, size:int, offset:int) -> int: return buf + offset
 
 def flag(nm, val): return (val << getattr(kgsl, f"{nm}_SHIFT")) & getattr(kgsl, f"{nm}_MASK")
 
+Compiled.pm_encode += PatternMatcher([
+  (UPat.sink(arg=KernelInfo("qcom_compute_submit")).call(UPat()).after(allow_any_len=True, name="s"), lambda s: QCOMComputeQueue(s).encode()),
+])
+
 class QCOMDevice(Compiled):
   timestamp_divider = 19.2
-  pm_encode = PatternMatcher([
-    (UPat(Ops.CALL, src=(UPat.custom_function("submit_qcom_compute"), UPat()), name="s"), lambda s: QCOMComputeQueue(s).encode()),
-  ])
 
   @property
   def has_copy_queue(self) -> bool: return False
@@ -324,6 +331,10 @@ class QCOMDevice(Compiled):
     info = kgsl.struct_kgsl_devinfo()
     kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY(self.fd, type=kgsl.KGSL_PROP_DEVICE_INFO, value=ctypes.addressof(info), sizebytes=ctypes.sizeof(info))
     self.gpu_id = (info.chip_id >> 24, (info.chip_id >> 16) & 0xFF, (info.chip_id >> 8) & 0xFF)
+    dev_id = mesa.struct_fd_dev_id(self.gpu_id[0] * 100 + self.gpu_id[1] * 10 + self.gpu_id[2], info.chip_id)
+    self.fibers_per_sp = 128 * 16
+    try: self.fibers_per_sp = mesa.fd_dev_info(dev_id).fibers_per_sp or self.fibers_per_sp
+    except AttributeError: pass
 
     # a7xx start with 730x or 'Cxxx', a8xx starts 'Exxx'
     if self.gpu_id[:2] >= (7, 3): raise RuntimeError(f"Unsupported GPU: chip_id={info.chip_id:#x}")
@@ -335,17 +346,12 @@ class QCOMDevice(Compiled):
                      arch=("a%d%d%d" + (",IMAGE_PITCH_ALIGNMENT=64" if IMAGE else "")) % self.gpu_id)
 
     self.var_vals = {"kgsl_fd": self.fd.fd, "kgsl_ctx": self.ctx}
-    Compiled.pm_bufferize += PatternMatcher([
-      (UPat(Ops.ALLOC, tag=self.tag("stack"), name="b"), lambda b, d=self: d._ensure_stack_size(b.max_numel())),
-      (UPat(Ops.ALLOC, tag=self.tag("dummy")), lambda d=self: d.dummy),
-      (UPat(Ops.ALLOC, tag=self.tag("border_color")), lambda d=self: d.border_color)])
 
-  @functools.cached_property
-  def dummy(self) -> Buffer: return Buffer(self.device, 0x1000, options=BufferSpec(nolru=True), preallocate=True) # cache flush target
-
-  @functools.cached_property
-  def border_color(self) -> Buffer: # zeros: the samplers clamp to a black border
-    return Buffer(self.device, 0x1000, options=BufferSpec(nolru=True), initial_value=bytes(0x1000))
+    # the cache flush target, and zeros: the samplers clamp to a black border
+    dummy = Buffer(self.device, 0x1000, options=BufferSpec(nolru=True), preallocate=True, allocator=self.allocator)
+    border_color = Buffer(self.device, 0x1000, options=BufferSpec(nolru=True), initial_value=bytes(0x1000), allocator=self.allocator)
+    stack = {to_name(self.device, "stack"): lambda b: self._ensure_stack_size(b.max_numel())}
+    Compiled.link_bufs |= stack | {to_name(self.device, "dummy"): dummy, to_name(self.device, "border_color"): border_color}
 
   def _gpu_alloc(self, size:int, flags:int=0, uncached=False, fill_zeroes=False) -> BufferStorage:
     flags |= flag("KGSL_MEMALIGN", alignment_hint:=12) | kgsl.KGSL_MEMFLAGS_USE_CPU_MAP
@@ -359,7 +365,7 @@ class QCOMDevice(Compiled):
 
   def _gpu_map(self, ptr:int, size:int) -> BufferStorage:
     ptr_aligned, size_aligned = (ptr & ~0xfff), round_up(size + (ptr & 0xfff), 0x1000)
-    dcache_flush().fxn(ctypes.c_uint64(ptr_line_aligned:=ptr & ~63), ceildiv(ptr + size - ptr_line_aligned, 64))
+    dcache_flush()(ptr_line_aligned:=ptr & ~63, ceildiv(ptr + size - ptr_line_aligned, 64))
     try:
       mi = kgsl.IOCTL_KGSL_MAP_USER_MEM(self.fd, hostptr=ptr_aligned, len=size_aligned, memtype=kgsl.KGSL_USER_MEM_TYPE_ADDR)
       return BufferStorage(mi.gpuaddr + (ptr - ptr_aligned), (mi, False), MMIOInterface(ptr, size, fmt='B'))

@@ -1,4 +1,5 @@
 from __future__ import annotations
+import functools
 from typing import Callable, cast
 from dataclasses import dataclass, replace
 from tinygrad.helpers import prod, Target, EMULATED_DTYPES
@@ -37,7 +38,7 @@ class Estimates:
     for u in uops:
       if u.op in {Ops.LOAD, Ops.STORE}:
         buf = u
-        while len(buf.src) and buf.op not in {Ops.PARAM, Ops.BUFFER, Ops.ALLOC}: buf = buf.src[0]
+        while len(buf.src) and buf.op not in GroupOp.Defines: buf = buf.src[0]
         if buf.op is Ops.PARAM:
           # u.src[0] is INDEX, cap at buffer size for re-reads (e.g. matmul)
           accessed = mem.get((buf, u.op), 0) + u.src[0].max_numel() * u.src[0].dtype.itemsize * mults
@@ -45,7 +46,8 @@ class Estimates:
       if u.op is Ops.RANGE:
         mult_stack.append(mults)
         if u.dtype is not dtypes.void:  # unbounded loop, unknown trip count
-          mults *= cast(sint, u.src[0].ssimplify())
+          bound = u.src[0].without_after.simplify()
+          mults *= cast(sint, bound.vmax if bound.ranges else bound.ssimplify())
           # SPECIAL are already counted in mults
           mults = mults.substitute({x:x.const_like(0) for x in mults.toposort() if x.op is Ops.SPECIAL}) if isinstance(mults, UOp) else mults
       elif u.op in {Ops.END, Ops.BACKEDGE}: mults = mult_stack.pop(-1)
@@ -60,9 +62,13 @@ class Estimates:
         flops += 2 * prod(u.arg[0]) // u.arg[2] * mults
     return Estimates(ssimplify(flops), lds, sum(mem.values()))
 
+@functools.cache
+def _cached_renderer(cls:type[Renderer], target:Target) -> Renderer: return cls(target)
+
 class Renderer:
   target: Target
   suffix: str = ""
+  inline_prefix: str|None = None
   # TODO: make this generic with a list of supported types
   supports_float4: bool = True
   has_local: bool = True
@@ -74,12 +80,13 @@ class Renderer:
   shared_max: int = 32768
   tensor_cores: list[TensorCore] = []
   extra_matcher: PatternMatcher|None = None
+  packed_args: bool = False
   code_for_op: dict[Ops, Callable] = {}
 
   compiler: Compiler = Compiler()
 
   def __init__(self, target:Target): self.target = target
-  def __reduce__(self): return self.__class__, (self.target,)
+  def __reduce__(self): return _cached_renderer, (self.__class__, self.target)
   def render(self, uops:list[UOp]) -> str: raise NotImplementedError("needs a renderer")
   def asm(self, prg:UOp, lin:UOp) -> bytes: raise NotImplementedError("needs an assembler")
   def supported_dtypes(self) -> set[DType]:
