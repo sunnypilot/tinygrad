@@ -1124,12 +1124,13 @@ def _exp_of(x:UOp, emin:int) -> UOp:  # unbiased exponent of a finite f32-held v
   i32 = dtypes.int32
   e = ((x.cast(_F64).bitcast(dtypes.uint64) >> _c(52, dtypes.uint64)) & _c(0x7FF, dtypes.uint64)).cast(i32) - _c(1023, i32)
   return x.eq(_c(0.0, x.dtype)).where(_c(-4000, i32), e.maximum(_c(emin, i32)))
-def _floor_sum(ps:list[UOp], q:UOp) -> UOp:  # floor((p0 + p1) / q) of an exactly held pair sum, the low part kept by two-sum
-  if len(ps) == 1: return _pcode._floor(ps[0] / q)
+def _pow2(e:UOp) -> UOp: return ((e + _c(1023, dtypes.int32)).cast(dtypes.uint64) << _c(52, dtypes.uint64)).bitcast(_F64)  # 2^e, -1022 <= e <= 1023
+def _floor_sum(ps:list[UOp], q:UOp, iq:UOp) -> UOp:  # floor((p0 + p1) / q) of an exactly held pair sum, the low part kept by two-sum
+  if len(ps) == 1: return _pcode._floor(ps[0] * iq)
   s = ps[0] + ps[1]
   bb = s - ps[0]
   err = (ps[0] - (s - bb)) + (ps[1] - bb)
-  f = _pcode._floor(s / q)
+  f = _pcode._floor(s * iq)
   return ((f * q).eq(s) & (err < _c(0.0, _F64))).where(f - _c(1.0, _F64), f)
 def _grid_dot(a:list[UOp], b:list[UOp], c:UOp, emin:int, cmin:int) -> UOp:
   i32 = dtypes.int32
@@ -1137,10 +1138,10 @@ def _grid_dot(a:list[UOp], b:list[UOp], c:UOp, emin:int, cmin:int) -> UOp:
   ep = functools.reduce(lambda x, y: x.maximum(y), [_exp_of(x, emin) + _exp_of(y, emin) for x, y in zip(a, b)])
   ec = _exp_of(c, cmin)  # a denormal accumulator counts at its type's smallest exponent
   e = (ep - _c(24, i32)).maximum(ec - _c(26, i32)).maximum(_c(-1000, i32))
-  q = ((e + _c(1023, i32)).cast(dtypes.uint64) << _c(52, dtypes.uint64)).bitcast(_F64)
+  q, iq = _pow2(e), _pow2(-e)
   cf = c.cast(_F64)
-  c_al = (ec < e).where(_c(0.0, _F64), _pcode._floor(cf / q))
-  terms = [_floor_sum(ps[i:i+2], q) for i in range(0, len(ps), 2)]
+  c_al = (ec < e).where(_c(0.0, _F64), _pcode._floor(cf * iq))
+  terms = [_floor_sum(ps[i:i+2], q, iq) for i in range(0, len(ps), 2)]
   return (functools.reduce(lambda x, y: x + y, terms) + c_al) * q
 def _grid_dot8(a:list[UOp], b:list[UOp], c:UOp, emin_a:int, emin_b:int) -> UOp:
   i32 = dtypes.int32
@@ -2293,18 +2294,24 @@ def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
     if not sparse: return data.index(256+n*16+k)
     kd = data.index(768+r*16+k).cast(dtypes.int)
     return data.index((kd < _c(16)).where(_c(256) + n*16 + kd, _c(1024) + n*16 + kd - _c(16)))
-  def hw_dot(r:int) -> UOp:
+  def hw_acc(a:list[UOp], b:list[UOp], c0:UOp) -> UOp:  # the grid-floored sum of the four k groups
     emin = {'F16': -14, 'BF16': -126}[a_fmt]
     cmin = -14 if output_type == 'F16' else -126
-    a = [data.index(r*16+k).bitcast(out_dt) for k in range(16)]
-    b = [bget(r, k).bitcast(out_dt) for k in range(16)]
-    c0 = data.index(512+r*16+n).bitcast(out_dt)
     acc = c0
     for g in range(0, 16, 4):
       s_ = _grid_dot(a[g:g+4], b[g:g+4], acc, emin, cmin)
       if output_type == 'F32': acc = s_.cast(dtypes.float32)
       elif output_type == 'F16': acc = _rto32(s_).cast(dtypes.half).cast(dtypes.float32)
       else: acc = (s_.cast(dtypes.float32).bitcast(dtypes.uint32) & _c(0xFFFF0000)).bitcast(dtypes.float32)
+    return acc
+  def hd_acc(r:int, n:UOp) -> UOp:
+    return hw_acc([data.index(r*16+k).bitcast(out_dt) for k in range(16)], [data.index(256+n*16+k).bitcast(out_dt) for k in range(16)],
+                  data.index(512+r*16+n).bitcast(out_dt))
+  def hw_dot(r:int) -> UOp:
+    a = [data.index(r*16+k).bitcast(out_dt) for k in range(16)]
+    b = [bget(r, k).bitcast(out_dt) for k in range(16)]
+    c0 = data.index(512+r*16+n).bitcast(out_dt)
+    acc = hw_acc(a, b, c0)
     u = dtypes.uint32
     if output_type == 'F32': fixed, dn, cq = _c(0xFFC00A3D, u), _c(0xFFC00000, u), _quiet(c0).bitcast(u)
     elif output_type == 'F16': fixed, dn, cq = _c(0xFE3D, u), _c(0xFE00, u), _quiet(c0.cast(dtypes.half)).bitcast(dtypes.uint16).cast(u)
@@ -2366,6 +2373,21 @@ def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
   else:  # f32/i32
     stores = [w_store(m, n, (hd[m][2].where(hd[m][1], mat_d[m].bitcast(dtypes.uint32)) if hd is not None else mat_d[m].bitcast(dtypes.uint32)),
                       d_map(m, n)[1]) for m in range(16)]
+  if hd is not None and output_type == 'F32' and not sparse and K == 16:
+    # finite A and B with |C| < 2^127 can't produce a NaN, an invalid product or an overflow (16 products of finite f16/bf16 stay far
+    # below f32 max), so the special-value tracking returns the grid sum unchanged: one check per instruction skips it
+    def plain(x:UOp) -> UOp: return x.abs() < _c(2.0**127, dtypes.float32)
+    e2 = ctx.range(256)
+    chk = [v.substitute({elem: e2}) for v in values[:3]]
+    ok = (plain(chk[0]) & plain(chk[1]) & plain(chk[2])).ne(True).cast(dtypes.uint32).reduce(e2, arg=Ops.MAX).eq(0)
+    def gate(cnt:UOp) -> UOp:
+      ctx._axis_id += 1
+      return UOp.range(cnt.cast(dtypes.int), ctx._axis_id, AxisType.LOOP, dtype=dtypes.int)
+    g_fast, g_full, nf = gate(ok), gate(ok.ne(True)), ctx.range(16)
+    fast = [ctx.wvgpr_dyn(vdst_reg + _c(d_map(m, nf)[1]), _c(d_map(m, 0)[0], dtypes.int) + nf,
+                          hd_acc(m, nf).bitcast(dtypes.uint32), exec_mask, after=g_fast) for m in range(16)]
+    full = [st.replace(src=(st.src[0].replace(src=(st.src[0].src[0].after(g_full), *st.src[0].src[1:])), *st.src[1:])) for st in stores]
+    return UOp.sink(UOp.group(*fast).end(nf).end(g_fast), UOp.group(*full).end(n).end(g_full))
   return UOp.sink(UOp.group(*stores).end(n))
 
 _INT_DOTS = {'V_DOT4_U32_U8': (8, False), 'V_DOT8_U32_U4': (4, False), 'V_DOT4_I32_IU8': (8, True), 'V_DOT8_I32_IU4': (4, True)}
