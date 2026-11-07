@@ -5,7 +5,7 @@
 #   arg=2: vmem - base address 0, INDEX offsets directly to host memory
 #   arg=3: lds - local data share
 #   arg=4: scratch - per-lane scratch memory
-import os, ctypes, functools, itertools, re, platform, subprocess, tempfile, traceback
+import os, ctypes, functools, hashlib, itertools, pathlib, pickle, re, platform, subprocess, tempfile, traceback
 from typing import Callable
 
 # Set/restore DAZ+FTZ (denormals-are-zero + flush-to-zero) to match RDNA3 default float mode
@@ -58,7 +58,7 @@ from tinygrad.engine.realize import get_runtime
 from tinygrad.codegen import to_program, to_program_config
 from tinygrad.renderer import Renderer
 import tinygrad.renderer.llvmir  # noqa: F401  # registers LLVM_STRICT_FP, which the emulator's kernels compile under
-from tinygrad.helpers import Context, DEV, to_mv, ContextVar
+from tinygrad.helpers import Context, DEV, DEBUG, to_mv, ContextVar
 from tinygrad.runtime.autogen import hsa
 from tinygrad.viz.serve import amd_decode, get_cfg, COND_TAKEN, COND_NOT_TAKEN, UNCOND, get_elf_section
 
@@ -1442,7 +1442,38 @@ def sig_verified(sig:str) -> bool:
     atoms += [{**base, f: b ^ bit} for bit in (1 << i for i in range(8)) if (q ^ b) & bit] if f in _BIT_FIELDS else [{**base, f: q}]
   return all(_make_sig(op, a) in verified for a in atoms)
 def inst_signature(inst) -> str: return _make_sig(inst.op_name.lower(), {f: getattr(inst, f, 0) or 0 for f in _SIG_FIELDS})
+EMU_CACHE = ContextVar("EMU_CACHE", 1)
+@functools.cache
+def _emu_digest() -> str:
+  import tinygrad
+  h = hashlib.sha256()
+  here = pathlib.Path(__file__).parent
+  for f in sorted([*pathlib.Path(tinygrad.__file__).parent.rglob("*.py"), *here.glob("*.py"), *here.glob("*.sigs")]):
+    h.update(str(f.relative_to(f.parents[1])).encode() + b"\0" + f.read_bytes() + b"\0")
+  try:
+    from tinygrad.runtime.autogen import llvm
+    st = os.stat(path:=llvm.dll._name)
+    h.update(f"{path}:{st.st_size}:{st.st_mtime_ns}".encode())
+  except Exception as e: h.update(f"no llvm: {e}".encode())
+  return h.hexdigest()
+@functools.cache
+def _host_cpu() -> str:
+  from tinygrad.runtime.autogen import llvm
+  return ctypes.string_at(llvm.LLVMGetHostCPUName()).decode() + ":" + ctypes.string_at(llvm.LLVMGetHostCPUFeatures()).decode()
+def _cache_key(*parts) -> str: return hashlib.sha256(pickle.dumps((_emu_digest(), *parts))).hexdigest()
+def _cached(table:str, key:str, fn:Callable):
+  from tinygrad.helpers import diskcache_get, diskcache_put
+  if not EMU_CACHE.value: return fn()
+  if (ret:=diskcache_get(table, key)) is None:
+    ret = fn()
+    try: diskcache_put(table, key, ret)
+    except Exception as e:
+      if DEBUG >= 1: print(f"emu cache: {table} not stored: {type(e).__name__}: {e}")
+  return ret
+
 def hw_unverified(elf:bytes) -> dict[str, int]:
+  return dict(_cached("emu_hw_unverified", _cache_key(elf, HW_FLOAT_MODE), lambda: _hw_unverified(elf)))
+def _hw_unverified(elf:bytes) -> dict[str, int]:
   out:dict[str, int] = {}
   mode = (int.from_bytes(get_elf_section(elf, ".rodata").content[48:52], "little") >> 12) & 0xFF
   if mode != HW_FLOAT_MODE: out[f"float_mode=0x{mode:02x}"] = 1
@@ -3118,7 +3149,9 @@ def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, 
     if arch == "rdna4" and HW_FLOAT.value: _hw_tables()
     renderer = Device['CPU'].renderer
     if (key:=(code, arch, dispatch, name, type(renderer), renderer.target, *(x.value for x in to_program_config))) not in dispatch_cache:
-      dispatch_cache[key] = to_program(lift(code, arch, renderer, dispatch, f"emu {name}"), renderer)
+      def build(): return to_program(lift(code, arch, renderer, dispatch, f"emu {name}"), renderer)
+      host = (platform.machine(), getattr(getattr(renderer, "compiler", None), "cachekey", None) or _host_cpu())
+      dispatch_cache[key] = build() if RELIFT.value else _cached("emu_program", _cache_key(*key[:4], repr(key[4:]), HW_FLOAT.value, host), build)
       relift_lib = code
       for relift_count in range(1, RELIFT.value+1):
         try:

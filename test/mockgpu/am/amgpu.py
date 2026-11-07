@@ -1,6 +1,6 @@
 # mypy: ignore-errors
 from __future__ import annotations
-import ctypes, struct, functools, os, mmap, tempfile
+import bisect, ctypes, struct, functools, os, mmap, tempfile
 from tinygrad.runtime.autogen.am import am, smu_14_0_2
 from tinygrad.runtime.autogen import libc
 from tinygrad.runtime.support.amd import AMDReg, import_asic_regs
@@ -45,6 +45,7 @@ class MockMMU:
   def __init__(self, gpu:MockAMGPU):
     self.gpu = gpu
     self.tlb: dict[int, tuple[int, int, bool]] = {}
+    self._vas: list[int] = []
 
   def invalidate(self, pt_base:int, va_base:int):
     new_tlb: dict[int, tuple[int, int, bool]] = {}
@@ -53,7 +54,7 @@ class MockMMU:
       old = self.tlb.get(va)
       if not is_sys and (old is None or old[0] != pa): self.gpu.map_vram_at(va, pa, sz)
       if old is None: self.gpu.map_range(va, sz)
-    self.tlb = new_tlb
+    self.tlb, self._vas = new_tlb, sorted(new_tlb)
 
   def _walk(self, pt_paddr:int, level:int, va_acc:int, out:dict, va_base:int):
     shift = [39, 30, 21, 12][level]
@@ -77,8 +78,9 @@ class MockMMU:
     sys_lo = self.gpu.mmio.regs.get(gmc.reg('regMMMC_VM_SYSTEM_APERTURE_LOW_ADDR') or 0, 0) << 18
     sys_hi = self.gpu.mmio.regs.get(gmc.reg('regMMMC_VM_SYSTEM_APERTURE_HIGH_ADDR') or 0, 0) << 18
     if sys_lo <= addr < sys_hi: return self.paddr_to_host(addr - self.gpu.mc_base)
-    for tva, (pa, sz, is_sys) in self.tlb.items():
-      if tva <= addr < tva + sz:
+    if (i:=bisect.bisect_right(self._vas, addr) - 1) >= 0:
+      pa, sz, is_sys = self.tlb[tva:=self._vas[i]]
+      if addr < tva + sz:
         paddr = pa + (addr - tva)
         if not is_sys: return self.gpu.vram_addr + paddr
         return self.paddr_to_host(paddr)
