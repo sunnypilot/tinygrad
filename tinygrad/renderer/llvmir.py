@@ -5,7 +5,7 @@ from tinygrad.renderer.cstyle import HIPRenderer, create_non_native_float_pats, 
 from tinygrad.codegen.decomp.transcendental import xexp2, xlog2
 from tinygrad.uop.ops import UOp, PatternMatcher, UPat, Ops, GroupOp, range_str
 from tinygrad.dtype import dtypes, float_to_fp8, DType, truncate, AddrSpace
-from tinygrad.helpers import prod, Target
+from tinygrad.helpers import prod, Target, ContextVar
 
 def is_volatile(u:UOp) -> bool: return (buf:=u.buf_uop).op in {Ops.PARAM, Ops.REFPARAM} and buf.arg.volatile
 
@@ -72,6 +72,9 @@ unsigned_lop = { Ops.ADD: "add", Ops.MUL: "mul", Ops.TRUNCDIV: "udiv", Ops.TRUNC
                  Ops.SHL: "shl", Ops.SHR: "lshr",}
 signed_lop = {**unsigned_lop, Ops.ADD: "add nsw", Ops.CMPLT: "icmp slt", Ops.TRUNCDIV: "sdiv", Ops.TRUNCMOD: "srem", Ops.SHR: "ashr"}
 flags = " contract afn"
+# STRICT_FP drops the fast-math flags so a float op means the same IEEE operation on every host (an emulator needs this)
+STRICT_FP = ContextVar("LLVM_STRICT_FP", 0)
+def _lop(dt, op) -> str: return lop[dt][op].replace(flags, "") if STRICT_FP and dtypes.is_float(dt) else lop[dt][op]
 float_lop = {Ops.ADD: "fadd"+flags, Ops.MUL: "fmul"+flags, Ops.CMPLT: f"fcmp{flags} olt",
     Ops.CMPNE: f"fcmp{flags} une", Ops.CMPEQ: f"fcmp{flags} oeq", Ops.FDIV: "fdiv"+flags}
 lop = {**{x:unsigned_lop for x in (dtypes.bool,)+dtypes.uints}, **{x:signed_lop for x in dtypes.sints}, **{x:float_lop for x in dtypes.floats}}
@@ -117,7 +120,10 @@ base_rewrite = PatternMatcher([
   (UPat(Ops.TRUNC, name="x"),
    lambda ctx,x: f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.trunc.{ldt(x.dtype)}({ldt(x.src[0].dtype)} {ctx[x.src[0]]})"),
   (UPat(GroupOp.Binary, name="x"), lambda ctx,x:
-   f"  {ctx[x]} = {lop[x.src[0].dtype][x.op]} {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}"),
+   f"  {ctx[x]} = {_lop(x.src[0].dtype, x.op)} {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ctx[x.src[1]]}"),
+  # an explicit fused multiply-add (only built on purpose: MULACC is not in code_for_op, so nothing fuses a*b+c into it)
+  (UPat(Ops.MULACC, dtypes.floats, name="x"), lambda ctx,x: f"  {ctx[x]} = call {ldt(x.dtype)} @llvm.fma.{ldt(x.dtype)}(" +
+   ", ".join(f"{ldt(y.dtype)} {ctx[y]}" for y in x.src) + ")"),
   (UPat(Ops.WHERE, name="x"), lambda ctx,x:
    f"  {ctx[x]} = select {ldt(x.src[0].dtype)} {ctx[x.src[0]]}, {ldt(x.src[1].dtype)} {ctx[x.src[1]]}, {ldt(x.src[2].dtype)} {ctx[x.src[2]]}"),
 

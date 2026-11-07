@@ -271,7 +271,7 @@ def mod_cases() -> list[tuple[str, list, dict, bool]]:
     for fields in singles:
       try: var = _variant(inst, **fields)
       except Exception: continue
-      vsig = signature(var)
+      vsig = signature(var) + "".join(f"|{t}" for t in ("s0=s1", "s0=s2") if sig.endswith(f"|{t}"))  # an aliased base keeps its tag
       if vsig != sig: variants.append((vsig, var, False))
     for vsig, var, hi16 in variants:
       if vsig in seen: continue
@@ -384,7 +384,7 @@ def run(outdir:str, limit:int, mods:bool=False, sigs:list[str]|None=None, consts
       except Exception as e:
         print(f"{sig}: FAILED {type(e).__name__}: {str(e)[:200]}", flush=True)
         np.savez(os.path.join(outdir, _fname(sig)), error=np.array(f"{type(e).__name__}: {e}"))
-        if "hang" in str(e):  # every later launch in this process would time out too: leave it to a fresh process
+        if "hang" in str(e) or "failed with" in str(e):
           print(f"{len(todo) - 1 - todo.index((sig, variants, spec))} left", flush=True)
           os._exit(0)
         continue

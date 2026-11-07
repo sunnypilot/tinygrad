@@ -57,6 +57,7 @@ from tinygrad.device import Buffer, BufferSpec, Device
 from tinygrad.engine.realize import get_runtime
 from tinygrad.codegen import to_program, to_program_config
 from tinygrad.renderer import Renderer
+import tinygrad.renderer.llvmir  # noqa: F401  # registers LLVM_STRICT_FP, which the emulator's kernels compile under
 from tinygrad.helpers import Context, DEV, to_mv, ContextVar
 from tinygrad.runtime.autogen import hsa
 from tinygrad.viz.serve import amd_decode, get_cfg, COND_TAKEN, COND_NOT_TAKEN, UNCOND, get_elf_section
@@ -112,13 +113,13 @@ def _vopd_rdna4(op):  # an rdna4 dual op runs the rdna4 VOP2/VOP1 op of the same
   n = op.name.replace('V_DUAL_', 'V_') + '_E32'
   return getattr(ir4.VOP2Op, n, None) or getattr(ir4.VOP1Op, n, None)
 VOPD_TO_VOP2.update({op: t for op in ir4.VOPDOp if (t := _vopd_rdna4(op)) is not None})
-_TINY_OPS = {'V_MUL_F32': 2, 'V_MUL_F16': 2, 'V_MUL_DX9_ZERO_F32': 2, 'V_FMA_F32': 3, 'V_FMA_F16': 3, 'V_FMAC_F32': 'D0', 'V_FMAC_F16': 'D0',
-             'V_FMA_DX9_ZERO_F32': 3}
+_TINY_OPS = {'V_MUL_F32': 2, 'V_MUL_F16': 2, 'V_MUL_DX9_ZERO_F32': 2, 'V_MULLIT_F32': 2, 'V_FMA_F32': 3, 'V_FMA_F16': 3, 'V_FMAC_F32': 'D0',
+             'V_FMAC_F16': 'D0', 'V_FMA_DX9_ZERO_F32': 3}
 def _tiny_before_rounding(name:str, srcs:dict, val:UOp) -> UOp|None:
   # a result that rounded up to the smallest normal is a denormal to omod (so +0) when, rounded with an unbounded exponent, it stays below
   k = _TINY_OPS.get(re.sub(r'_E(32|64)$', '', name))
   if k is None or val.dtype not in (dtypes.float32, dtypes.half): return None
-  rd = (lambda x: _ftz(_as(x, val.dtype)).cast(_F64)) if 'DX9' in name else (lambda x: _as(x, val.dtype).cast(_F64))  # dx9 flushes its inputs
+  rd = (lambda x: _ftz(_as(x, val.dtype)).cast(_F64)) if 'FMA_DX9' in name else (lambda x: _as(x, val.dtype).cast(_F64))
   ex = rd(srcs['S0']) * rd(srcs['S1']) + (rd(srcs['S2' if k == 3 else 'D0']) if k != 2 else _c(0.0, _F64))
   emin, mb = (-126, 23) if val.dtype == dtypes.float32 else (-14, 10)
   return val.abs().eq(_c(2.0 ** emin, val.dtype)) & (ex.abs() < _c(2.0 ** emin - 2.0 ** (emin - mb - 2), _F64))
@@ -813,7 +814,7 @@ def _invalid_product(a:UOp, b:UOp) -> UOp:
   return (ia & zb) | (za & ib)
 
 def _hw_fma_mix16(a:UOp, b:UOp, c:UOp) -> UOp:
-  if not _hw_float(): return (a * b + c).cast(dtypes.half)
+  if not _hw_float(): return _pcode._fma(a, b, c).cast(dtypes.half)
   f64, u64 = dtypes.float64, dtypes.uint64
   p, cc = a.cast(f64) * b.cast(f64), c.cast(f64)  # an f32 product is exact in f64
   s_ = p + cc
@@ -833,7 +834,7 @@ def _hw_fma_mix16(a:UOp, b:UOp, c:UOp) -> UOp:
   return (s_.ne(s_) | _invalid_product(a, b)).where(nan, r)
 
 def _hw_fma(a:UOp, b:UOp, c:UOp) -> UOp:
-  r = a * b + c
+  r = _pcode._fma(a, b, c)
   if not _hw_float() or r.dtype not in _FLOATS: return r
   ut = _uint_of(r)
   inv = _invalid_product(a, b) & a.eq(a) & b.eq(b)
@@ -903,11 +904,11 @@ _HW_CONV = {
   'i32_to_i16': lambda a: _sat(a.bitcast(dtypes.int32).cast(_F64) if a.dtype == dtypes.uint32 else a.cast(_F64), -32768, 32767, dtypes.int16),
   'u32_to_u16': lambda a: _sat(a.cast(dtypes.uint32).cast(_F64), 0, 65535, dtypes.uint16),
 }
-def _hw_cvt_sat_nan(x:UOp) -> UOp:
-  ut = _uint_of(x)
-  neg = (x.bitcast(ut) >> _c(8 * x.dtype.itemsize - 1, ut)).ne(_c(0, ut))
+def _hw_cvt_sat_nan(x:UOp, src:UOp) -> UOp:  # a NaN source saturates by its own sign: arithmetic on the way may change a NaN's sign by host
+  ut = _uint_of(src)
+  neg = (src.bitcast(ut) >> _c(8 * src.dtype.itemsize - 1, ut)).ne(_c(0, ut))
   nan = neg.where(_c(-0x80000000, dtypes.int32), _c(0x7FFFFFFF, dtypes.int32))
-  return x.ne(x).where(nan, _pcode._f_to_i32(x))
+  return src.ne(src).where(nan, _pcode._f_to_i32(x))
 def _hw_frexp(x:UOp, mant:bool) -> UOp:
   ut, (eb, mb) = _uint_of(x), {2: (5, 10), 4: (8, 23), 8: (11, 52)}[x.dtype.itemsize]
   b, bias = x.bitcast(ut), (1 << (eb - 1)) - 2
@@ -969,8 +970,8 @@ def _hw_pk_rtz(a:UOp, b:UOp) -> UOp:
   return lo.cast(dtypes.uint32) | (hi.cast(dtypes.uint32) << _c(16))
 for _n, _fn in _HW_CONV.items():
   _FUNCS[_n] = (lambda hw, orig: lambda *a: hw(*a) if _hw_float() else orig(*a))(_fn, _FUNCS[_n])
-_FUNCS.update(hw_cvt_floor=lambda x: _hw_cvt_sat_nan(_pcode._floor(_as(x, dtypes.float32))),
-              hw_cvt_nearest=lambda x: _hw_cvt_sat_nan(_pcode._floor(_as(x, dtypes.float32).cast(_F64) + _c(0.5, _F64))),
+_FUNCS.update(hw_cvt_floor=lambda x: _hw_cvt_sat_nan(_pcode._floor(_as(x, dtypes.float32)), _as(x, dtypes.float32)),
+              hw_cvt_nearest=lambda x: _hw_cvt_sat_nan(_pcode._floor(_as(x, dtypes.float32).cast(_F64) + _c(0.5, _F64)), _as(x, dtypes.float32)),
               hw_frexp_mant=lambda x: _hw_frexp(x, True), hw_frexp_exp=lambda x: _hw_frexp(x, False), hw_fract=_hw_fract,
               hw_ldexp=_hw_ldexp, hw_cvt_off=_hw_cvt_off, hw_pk_rtz=_hw_pk_rtz)
 def _hw_maximum(is_max:bool, *xs:UOp) -> UOp:
@@ -1329,6 +1330,9 @@ def _hw_qsad(a:UOp, b:UOp, c:UOp, clmp:UOp, masked:bool) -> UOp:
     acc = (clmp.cast(u64).ne(_c(0, u64)) & (acc > _c(0xFFFF, u64))).where(_c(0xFFFF, u64), acc)
     out = out | ((acc & _c(0xFFFF, u64)) << _c(16 * j, u64))
   return out
+_FUNCS['hw_amdnan64'] = lambda r, a: _amd_nan(_as(r, _F64), [_as(a, _F64)])  # an invalid op's NaN is the host's otherwise (arm +, x86 -)
+_HW_PCODE.update({'V_SQRT_F64': 'D0.f64 = hw_amdnan64(sqrt(S0.f64), S0.f64)', 'V_RSQ_F64': 'D0.f64 = hw_amdnan64(1.0 / sqrt(S0.f64), S0.f64)',
+                  'V_RCP_F64': 'D0.f64 = hw_amdnan64(1.0 / S0.f64, S0.f64)'})
 _FUNCS['hw_trig_preop'] = lambda sh: _pcode._trig_preop(sh, low=18)  # gfx1200 keeps 2/pi down to bit 18 of the 1201
 _FUNCS['hw_mqsad'] = lambda a, b, c, clmp: _hw_qsad(a, b, c, clmp, True)
 _FUNCS['hw_qsad'] = lambda a, b, c, clmp: _hw_qsad(a, b, c, clmp, False)
@@ -3107,7 +3111,7 @@ REPLAY_EMU = ContextVar("REPLAY_EMU", 0)
 def run_asm(lib: int, lib_sz: int, gx: int, gy: int, gz: int, lx: int, ly: int, lz: int, args_ptr: int, rsrc2: int = 0x19c,
             scratch_size: int = 0, arch: str = "rdna3", name: str = "asm") -> int:
   """Execute AMD assembly program. scratch_size is private_segment_fixed_size from kernel descriptor (per-lane)."""
-  with Context(DEV=DEV.target('CPU', renderer='LLVM'), NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="",
+  with Context(DEV=DEV.target('CPU', renderer='LLVM'), LLVM_STRICT_FP=1, NOOPT=1, CHECK_OOB=0, TUPLE_ORDER=0, EMULATED_DTYPES="",
                CAPTURE_PROCESS_REPLAY=REPLAY_EMU.value, DEFAULT_FLOAT="float32", DEFAULT_INT="int32", TRANSCENDENTAL=1):
     code = bytes(to_mv(lib, lib_sz))
     dispatch = (gx, gy, gz, lx, ly, lz, rsrc2, scratch_size)

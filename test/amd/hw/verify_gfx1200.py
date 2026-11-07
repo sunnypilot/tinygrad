@@ -1,6 +1,6 @@
 # Writes test/mockgpu/amd/gfx1200_verified.sigs: the rdna4 instruction signatures whose emulator results were bit-identical to a gfx1200
 # gpu in every probe that ran them.
-#   python test/amd/hw/verify_gfx1200.py unpack HW_ROOT    the committed gfx1200 results (test/mockgpu/amd/gfx1200_hw/*.part*) -> HW_ROOT
+#   python test/amd/hw/verify_gfx1200.py unpack HW_ROOT    the committed gfx1200 results (test/mockgpu/amd/gfx1200_hw/*.tar.part*) -> HW_ROOT
 #   python test/amd/hw/verify_gfx1200.py emu HW_ROOT EMU_ROOT    every probe on the emulator (DEV=MOCKUSB+AMD), same signatures as HW_ROOT
 #   python test/amd/hw/verify_gfx1200.py verify HW_ROOT EMU_ROOT
 # A root holds all/ mods/ sigs/ consts/ dpp/ (probe_all.py), mat/ (probe_matrix.py) and rounding.npz (probe_rounding.py). A signature is
@@ -21,17 +21,20 @@ FOLD = ("|hi16", "|x", "|y", "|s0=s1", "|s0=s2", "|consts", "|dpp", "|finite")
 def _same(a, b) -> bool: return a.shape == b.shape and np.array_equal(a, b)
 
 def unpack(out:str):
-  parts = sorted(glob.glob(os.path.join(PARTS, "gfx1200_hw.tar.part*")))
   os.makedirs(out, exist_ok=True)
-  with tempfile.TemporaryFile() as f:
-    for p in parts:
-      with open(p, "rb") as g: f.write(g.read())
-    f.seek(0)
-    with tarfile.open(fileobj=f) as t: t.extractall(out, filter="data")
+  for tar in sorted({p.rsplit(".part", 1)[0] for p in glob.glob(os.path.join(PARTS, "gfx1200_hw_*.tar.part*"))}):
+    with tempfile.TemporaryFile() as f:
+      for p in sorted(glob.glob(tar + ".part*")):
+        with open(p, "rb") as g: f.write(g.read())
+      f.seek(0)
+      with tarfile.open(fileobj=f) as t: t.extractall(out, filter="data")
 
 def emu(hw:str, out:str):
   env = {**os.environ, "DEV": "MOCKUSB+AMD", "CHECK_OOB": "0", "GMMU": "0"}
-  def probe(*a): subprocess.run([sys.executable, *a], env=env, check=True, stdout=subprocess.DEVNULL)
+  def probe(*a):
+    for _ in range(50):
+      out = subprocess.run([sys.executable, *a], env=env, capture_output=True, text=True).stdout.strip().splitlines()
+      if not out or not out[-1].endswith(" left") or out[-1] == "0 left": return
   for d, mode in PASSES.items(): probe(os.path.join(here, "probe_all.py"), mode, os.path.join(out, d))
   sigs = sorted(os.path.basename(f)[:-4].replace("+", "|") for f in glob.glob(os.path.join(hw, "sigs", "*.npz")))
   with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f: json.dump(sigs, f)
