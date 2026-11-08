@@ -1113,8 +1113,7 @@ _FUNCS.update(hw_sin16=lambda a: _f16_table('sin_f16', _as(a, dtypes.half)), hw_
 _SC_NA = (1 << 24) + 6 * (1 << 23)  # table entries: every R < 2^24, then multiples of 2^j in [2^(23+j), 2^(24+j)), j = 1..6
 def _tab_word(name:str, i:UOp) -> UOp: return _tab_bits(name, i.cast(dtypes.uint64) * _c(4, dtypes.uint64), 4).cast(dtypes.uint32)
 def _sc_coef(s:UOp, k:int) -> UOp:
-  i = s * _c(12, dtypes.int64) + _c(2 * k, dtypes.int64)
-  return (_tab_word("sc_coefs", i).cast(dtypes.uint64) | (_tab_word("sc_coefs", i + _c(1, dtypes.int64)).cast(dtypes.uint64) << _c(32, dtypes.uint64))).bitcast(_F64)
+  return _tab_i64("sc_coefs", s * _c(6, dtypes.int64) + _c(k, dtypes.int64)).bitcast(_F64)
 def _sc_core(R0:UOp, cos:bool) -> UOp:
   # R0 = trunc(frac|x| * 2^31) -> core bits (uint32). core(R + 2^30) = -core(R), cos = core(R + 2^29). per 2^-7 segment a degree-5
   # f64 Horner on R quantised as the hardware does (seg 0 exact, seg 1 to 4, else to 16; segs 0 and 63 times the distance to the zero),
@@ -1206,41 +1205,74 @@ _WMMA_C = r"""
 #include <stdint.h>
 #include <string.h>
 static inline double bd(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
-static inline uint64_t db(double d) { uint64_t u; memcpy(&u, &d, 8); return u; }
 static inline float bf(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static inline uint32_t fb(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
-static inline int expo(float x, int emin) {
-  int e = (int)((db((double)x) >> 52) & 0x7FF) - 1023; e = e < emin ? emin : e; return x == 0.0f ? -4000 : e;
-}
 static inline double p2(int e) { return bd((uint64_t)(e + 1023) << 52); }
-static inline double fl(double x) { double t = __builtin_trunc(x); return (x < 0.0 && x != t) ? t - 1.0 : t; }
 static inline double fsum(double p0, double p1, double q, double iq) {
-  double s = p0 + p1, bb = s - p0, err = (p0 - (s - bb)) + (p1 - bb), f = fl(s * iq);
+  double s = p0 + p1, bb = s - p0, err = (p0 - (s - bb)) + (p1 - bb), f = __builtin_floor(s * iq);
   return (f * q == s && err < 0.0) ? f - 1.0 : f;
 }
-// t: A at [r*16+k], B at [256+n*16+k], C at [512+r*16+n] (f32 bits of f16/bf16 inputs); D -> [768+r*16+n]
-void emu_wmma_grid(uint32_t *t, int emin) {
-  float bt[16][16]; int eb[16][16];
-  for (int k = 0; k < 16; k++) for (int n = 0; n < 16; n++) { bt[k][n] = bf(t[256 + n*16 + k]); eb[k][n] = expo(bt[k][n], emin); }
+static inline int expo32(uint32_t x) {
+  int ex = (int)((x >> 23) & 0xFF), e = ex == 255 ? 1024 : ex - 127; e = e < -126 ? -126 : e; return (x & 0x7FFFFFFF) == 0 ? -4000 : e;
+}
+static inline double h2d(uint32_t h) {
+  uint32_t s = (h & 0x8000) << 16, e5 = (h >> 10) & 0x1F, m = h & 0x3FF;
+  uint32_t nb = s | ((e5 + 112) << 23) | (m << 13), db = s | fb((float)m * 0x1p-24f);
+  return (double)bf(e5 ? nb : db);
+}
+static inline int h2e(uint32_t h) { int e5 = (int)((h >> 10) & 0x1F); return (h & 0x7FFF) == 0 ? -4000 : e5 ? e5 - 15 : -14; }
+static inline double b2d(uint32_t h) { return (double)bf(h << 16); }
+static inline int b2e(uint32_t h) { int e8 = (int)((h >> 7) & 0xFF); return (h & 0x7FFF) == 0 ? -4000 : e8 ? e8 - 127 : -126; }
+int emu_wmma_rdna4(uint32_t *v, uint32_t s0, uint32_t s1, uint32_t s2, uint32_t vd, uint32_t exec, uint32_t cc, int cvgpr, int bf16) {
+  uint32_t bad = 0, cb[16][16];
+  for (int j = 0; j < 4; j++) for (int l = 0; l < 32; l++) {
+    uint32_t wa = v[(s0 + j) * 32 + l], wb = v[(s1 + j) * 32 + l];
+    bad |= bf16 ? (((wa & 0x7FFF) >= 0x7F00) | (((wa >> 16) & 0x7FFF) >= 0x7F00) | ((wb & 0x7FFF) >= 0x7F00) | (((wb >> 16) & 0x7FFF) >= 0x7F00))
+                : (((wa & 0x7C00) == 0x7C00) | ((wa & 0x7C000000) == 0x7C000000) | ((wb & 0x7C00) == 0x7C00) | ((wb & 0x7C000000) == 0x7C000000));
+  }
+  for (int j = 0; j < 8; j++) for (int l = 0; l < 32; l++) {
+    uint32_t x = cvgpr ? v[(s2 + j) * 32 + l] : cc;
+    cb[j + (l >> 4) * 8][l & 15] = x; bad |= (x & 0x7FFFFFFF) >= 0x7F000000;
+  }
+  if (bad) return 0;
+  double at[16][16], bt[16][16]; int ea[16][16], eb[16][16];
+  uint32_t ha[16][16], hb[16][16];
+  for (int j = 0; j < 4; j++) for (int h = 0; h < 2; h++) for (int hl = 0; hl < 2; hl++) {
+    int el = 2 * j + h, k = (el & 3) | (hl << 2) | ((el >> 2) << 3);
+    for (int i = 0; i < 16; i++) {
+      ha[k][i] = (v[(s0 + j) * 32 + hl * 16 + i] >> (16 * h)) & 0xFFFF;
+      hb[k][i] = (v[(s1 + j) * 32 + hl * 16 + i] >> (16 * h)) & 0xFFFF;
+    }
+  }
+  if (bf16) for (int k = 0; k < 16; k++) for (int i = 0; i < 16; i++) {
+    at[k][i] = b2d(ha[k][i]); ea[k][i] = b2e(ha[k][i]); bt[k][i] = b2d(hb[k][i]); eb[k][i] = b2e(hb[k][i]);
+  } else for (int k = 0; k < 16; k++) for (int i = 0; i < 16; i++) {
+    at[k][i] = h2d(ha[k][i]); ea[k][i] = h2e(ha[k][i]); bt[k][i] = h2d(hb[k][i]); eb[k][i] = h2e(hb[k][i]);
+  }
   for (int r = 0; r < 16; r++) {
-    float acc[16], a[16]; int ea[16];
-    for (int k = 0; k < 16; k++) { a[k] = bf(t[r*16 + k]); ea[k] = expo(a[k], emin); }
-    for (int n = 0; n < 16; n++) acc[n] = bf(t[512 + r*16 + n]);
+    float acc[16];
+    for (int n = 0; n < 16; n++) acc[n] = bf(cb[r][n]);
     for (int g = 0; g < 16; g += 4) {
+      double a0 = at[g][r], a1 = at[g+1][r], a2 = at[g+2][r], a3 = at[g+3][r];
+      int e0 = ea[g][r], e1 = ea[g+1][r], e2 = ea[g+2][r], e3 = ea[g+3][r];
       for (int n = 0; n < 16; n++) {
-        double p0 = (double)a[g] * (double)bt[g][n], p1 = (double)a[g+1] * (double)bt[g+1][n];
-        double p2_ = (double)a[g+2] * (double)bt[g+2][n], p3 = (double)a[g+3] * (double)bt[g+3][n];
-        int ep = ea[g] + eb[g][n], s1 = ea[g+1] + eb[g+1][n], s2 = ea[g+2] + eb[g+2][n], s3 = ea[g+3] + eb[g+3][n];
-        ep = ep > s1 ? ep : s1; ep = ep > s2 ? ep : s2; ep = ep > s3 ? ep : s3;
-        int ec = expo(acc[n], -126);
+        double p0 = a0 * bt[g][n], p1 = a1 * bt[g+1][n], p2_ = a2 * bt[g+2][n], p3 = a3 * bt[g+3][n];
+        int ep = e0 + eb[g][n], s1_ = e1 + eb[g+1][n], s2_ = e2 + eb[g+2][n], s3 = e3 + eb[g+3][n];
+        ep = ep > s1_ ? ep : s1_; ep = ep > s2_ ? ep : s2_; ep = ep > s3 ? ep : s3;
+        int ec = expo32(fb(acc[n]));
         int e = ep - 24; e = e > ec - 26 ? e : ec - 26; e = e > -1000 ? e : -1000;
         double q = p2(e), iq = p2(-e);
-        double c_al = ec < e ? 0.0 : fl((double)acc[n] * iq);
+        double c_al = ec < e ? 0.0 : __builtin_floor((double)acc[n] * iq);
         acc[n] = (float)(((fsum(p0, p1, q, iq) + fsum(p2_, p3, q, iq)) + c_al) * q);
       }
     }
-    for (int n = 0; n < 16; n++) t[768 + r*16 + n] = fb(acc[n]);
+    for (int n = 0; n < 16; n++) cb[r][n] = fb(acc[n]);
   }
+  for (int j = 0; j < 8; j++) for (int l = 0; l < 32; l++) {
+    uint32_t *d = &v[(vd + j) * 32 + l];
+    *d = ((exec >> l) & 1) ? cb[j + (l >> 4) * 8][l & 15] : *d;
+  }
+  return 1;
 }
 """
 @functools.cache
@@ -1249,7 +1281,7 @@ def _wmma_native() -> bool:
   try:
     so = os.path.join(tempfile.mkdtemp(), "emu_wmma.so")
     cpu = "-march=native" if platform.machine() in ('x86_64', 'AMD64') else "-mcpu=native"
-    subprocess.check_output(['clang', '-shared', '-fPIC', '-O2', '-ffp-contract=off', '-fno-math-errno', cpu, '-x', 'c', '-', '-o', so],
+    subprocess.check_output(['clang', '-shared', '-fPIC', '-O3', '-ffp-contract=off', '-fno-math-errno', cpu, '-x', 'c', '-', '-o', so],
                             input=_WMMA_C.encode(), stderr=subprocess.DEVNULL)
     from tinygrad.runtime.support.c import DLL
     return DLL("emu_wmma", [so]).nm in DLL._loaded_
@@ -1447,7 +1479,8 @@ _F64C = {"rcp": dict(rb=24, ts=0, nR=32, sh=18, unit=64, neg=True), "rsq": dict(
         "sqrt": dict(rb=25, ts=1, nR=16, sh=17, unit=128, neg=False)}
 def _i64(v): return _c(v, dtypes.int64)
 def _tab_i64(name:str, i:UOp) -> UOp:
-  return (_tab_word(name, i * _i64(2)).cast(dtypes.uint64) | (_tab_word(name, i * _i64(2) + _i64(1)).cast(dtypes.uint64) << _c(32, dtypes.uint64))).bitcast(dtypes.int64)
+  lo, hi = _tab_word(name, i * _i64(2)).cast(dtypes.uint64), _tab_word(name, i * _i64(2) + _i64(1)).cast(dtypes.uint64)
+  return (lo | (hi << _c(32, dtypes.uint64))).bitcast(dtypes.int64)
 def _tab_i32(name:str, i:UOp) -> UOp: return _tab_word(name, i).bitcast(dtypes.int32).cast(dtypes.int64)
 def _fshr(x:UOp, k) -> UOp:  # floor(x / 2^k) on signed int64 using only shifts of non-negative values
   k = k if isinstance(k, UOp) else _i64(k)
@@ -1475,7 +1508,7 @@ def _tab_find(name_k:str, name_v:str, n:int, key:UOp, wide:bool) -> tuple[UOp, U
   found = (pos > _i64(0)) & _tab_i64(name_k, i).eq(key)
   return found, (_tab_i64(name_v, i) if wide else _tab_i32(name_v, i))
 def _f64_core(op:str, m29:UOp, pidx:UOp) -> UOp:
-  sp, i64 = _F64C[op], dtypes.int64
+  sp = _F64C[op]
   ng = 1 << 20
   R, t = m29 >> _i64(sp["rb"]), m29 & _i64((1 << sp["rb"]) - 1)
   tp = t >> _i64(sp["ts"])
@@ -1507,7 +1540,8 @@ def _f64_core(op:str, m29:UOp, pidx:UOp) -> UOp:
     dense = R.eq(_i64(31))
     A, lam = dense.where(Ad, A), dense.where(pat, lam)
   V = A + _i64(sp["unit"]) * lam
-  out = (g["E"].cast(dtypes.uint64) << _c(52, dtypes.uint64)) | ((V.cast(dtypes.uint64) << _c(sp["sh"], dtypes.uint64)) & _c((1 << 52) - 1, dtypes.uint64))
+  mant = (V.cast(dtypes.uint64) << _c(sp["sh"], dtypes.uint64)) & _c((1 << 52) - 1, dtypes.uint64)
+  out = (g["E"].cast(dtypes.uint64) << _c(52, dtypes.uint64)) | mant
   nei = _hw_table_len(f"f_{op}_ei") // 8
   if nei:
     found, eh = _tab_find(f"f_{op}_ei", f"f_{op}_eh", nei, (pidx << _i64(40)) + m29, True)
@@ -2470,6 +2504,15 @@ def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
   out_dt = dtypes.int32 if output_type == "I32" else dtypes.float32
   cbits = ctx.rsrc_dyn(src2_r, None, 32)
   cval_const = _FUNCS[f'{output_type.lower()}_to_f32'](cbits & _c(0xFFFF)) if output_type in ("F16", "BF16") else cbits.bitcast(out_dt)
+  native = (is_rdna4 and HW_FLOAT.value and a_fmt == b_fmt and a_fmt in ('F16', 'BF16') and output_type == 'F32' and not sparse and K == 16
+            and ctx.wave_size == 32 and _wmma_native())
+  if native:
+    ok = UOp.custom_function("emu_wmma_rdna4", dtype=dtypes.int32).call(
+      ctx.vgpr.index(_c(0, dtypes.int)), src0_r, src1_r, src2_r, vdst_reg, exec_mask, cbits, is_c_vgpr.cast(dtypes.int32),
+      _c(int(a_fmt == 'BF16'), dtypes.int32))
+    ctx._axis_id += 1
+    g_slow = UOp.range(ok.eq(_c(0, dtypes.int32)).cast(dtypes.int), ctx._axis_id, AxisType.LOOP, dtype=dtypes.int)
+    ctx.vgpr = ctx.vgpr.after(g_slow)
   elem = ctx.range(256)
   row, col = elem // 16, elem % 16
   lane, vgpr = d_map(row, col)
@@ -2592,6 +2635,7 @@ def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
   else:  # f32/i32
     stores = [w_store(m, n, (hd[m][2].where(hd[m][1], mat_d[m].bitcast(dtypes.uint32)) if hd is not None else mat_d[m].bitcast(dtypes.uint32)),
                       d_map(m, n)[1]) for m in range(16)]
+  if native: return UOp.sink(UOp.group(*stores).end(n).end(g_slow))
   if hd is not None and output_type == 'F32' and not sparse and K == 16:
     # finite A and B with |C| < 2^127 can't produce a NaN, an invalid product or an overflow (16 products of finite f16/bf16 stay far
     # below f32 max), so the special-value tracking returns the grid sum unchanged: one check per instruction skips it
@@ -2603,12 +2647,7 @@ def _compile_wmma(inst: ir3.VOP3P | ir4.VOP3P | irc.VOP3P, ctx: _Ctx) -> UOp:
       ctx._axis_id += 1
       return UOp.range(cnt.cast(dtypes.int), ctx._axis_id, AxisType.LOOP, dtype=dtypes.int)
     g_fast, g_full, nf = gate(ok), gate(ok.ne(True)), ctx.range(16)
-    if _wmma_native():
-      res = tmp.after(UOp.custom_function("emu_wmma_grid").call(data.after(g_fast).index(_c(0, dtypes.int)),
-                                                                _c({'F16': -14, 'BF16': -126}[a_fmt], dtypes.int32)))
-      def fast_val(m:int, n:UOp) -> UOp: return res.index(768 + m*16 + n)
-    else:
-      def fast_val(m:int, n:UOp) -> UOp: return hd_acc(m, n).bitcast(dtypes.uint32)
+    def fast_val(m:int, n:UOp) -> UOp: return hd_acc(m, n).bitcast(dtypes.uint32)
     fast = [ctx.wvgpr_dyn(vdst_reg + _c(d_map(m, nf)[1]), _c(d_map(m, 0)[0], dtypes.int) + nf, fast_val(m, nf), exec_mask, after=g_fast)
             for m in range(16)]
     full = [st.replace(src=(st.src[0].replace(src=(st.src[0].src[0].after(g_full), *st.src[0].src[1:])), *st.src[1:])) for st in stores]
