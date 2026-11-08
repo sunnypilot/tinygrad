@@ -673,8 +673,9 @@ _HW_TABLE_BASE = 0x200000000000  # a fixed address, so a lifted program reads th
 @functools.cache
 def _hw_tables() -> dict[str, int]:
   import mmap, numpy as np
-  t = np.load(os.path.join(os.path.dirname(os.path.abspath(__file__)), "gfx1200_rounding.npz"))
-  arrays = {k: np.ascontiguousarray(t[k]).view(np.uint8).reshape(-1) for k in t.files}
+  here = os.path.dirname(os.path.abspath(__file__))
+  arrays = {k: np.ascontiguousarray(t[k]).view(np.uint8).reshape(-1) for f in ("gfx1200_rounding.npz", "gfx1200_sincos.npz", "gfx1200_f64core.npz")
+            for t in [np.load(os.path.join(here, f))] for k in t.files}
   sizes = {k: (a.nbytes + 0xFFFF) & ~0xFFFF for k, a in arrays.items()}
   libc = ctypes.CDLL(None)
   libc.mmap.restype, libc.mmap.argtypes = ctypes.c_void_p, [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
@@ -686,6 +687,14 @@ def _hw_tables() -> dict[str, int]:
     offs[k], off = _HW_TABLE_BASE + off, off + sizes[k]
   return offs
 
+@functools.cache
+def _hw_table_len(name:str) -> int:
+  import numpy as np
+  here = os.path.dirname(os.path.abspath(__file__))
+  for f in ("gfx1200_rounding.npz", "gfx1200_sincos.npz", "gfx1200_f64core.npz"):
+    t = np.load(os.path.join(here, f))
+    if name in t.files: return t[name].nbytes
+  raise KeyError(name)
 def _tab_bits(name:str, byte_idx:UOp, nbytes:int) -> UOp:
   addr = _c(_hw_tables()[name], dtypes.uint64) + byte_idx.cast(dtypes.uint64)
   word = _Ctx.vmem.index((addr >> _c(2, dtypes.uint64)).cast(dtypes.int64)).load()
@@ -1101,23 +1110,72 @@ def _fma16_once(a, b, c): return _amd_nan(_rto32(_rto64(*_fma_exact(*_f3(a, b, c
 _FUNCS.update(hw_ftz0=_ftz0, hw_fma_dx9=_hw_fma_dx9, hw_mullit=_hw_mullit, hw_ftz=lambda x: _ftz(_as(x, dtypes.float32)),
               hw_quietf=lambda x: _quiet(_as(x, dtypes.float32)), hw_fma_rtz32=_fma_rtz32, hw_fma_rtz16=_fma_rtz16, hw_fma16_once=_fma16_once)
 _FUNCS.update(hw_sin16=lambda a: _f16_table('sin_f16', _as(a, dtypes.half)), hw_cos16=lambda a: _f16_table('cos_f16', _as(a, dtypes.half)))
+_SC_NA = (1 << 24) + 6 * (1 << 23)  # table entries: every R < 2^24, then multiples of 2^j in [2^(23+j), 2^(24+j)), j = 1..6
+def _tab_word(name:str, i:UOp) -> UOp: return _tab_bits(name, i.cast(dtypes.uint64) * _c(4, dtypes.uint64), 4).cast(dtypes.uint32)
+def _sc_coef(s:UOp, k:int) -> UOp:
+  i = s * _c(12, dtypes.int64) + _c(2 * k, dtypes.int64)
+  return (_tab_word("sc_coefs", i).cast(dtypes.uint64) | (_tab_word("sc_coefs", i + _c(1, dtypes.int64)).cast(dtypes.uint64) << _c(32, dtypes.uint64))).bitcast(_F64)
+def _sc_core(R0:UOp, cos:bool) -> UOp:
+  # R0 = trunc(frac|x| * 2^31) -> core bits (uint32). core(R + 2^30) = -core(R), cos = core(R + 2^29). per 2^-7 segment a degree-5
+  # f64 Horner on R quantised as the hardware does (seg 0 exact, seg 1 to 4, else to 16; segs 0 and 63 times the distance to the zero),
+  # rounded to f32, plus a measured 2-bit delta per R (code 3: one of 79 escapes)
+  i64 = dtypes.int64
+  def c(v): return _c(v, i64)
+  negh = R0 >= c(1 << 30)
+  Rh = negh.where(R0 - c(1 << 30), R0)
+  Rx = Rh + c(1 << 29) if cos else Rh
+  neg = Rx >= c(1 << 30)
+  Rf = neg.where(Rx - c(1 << 30), Rx)
+  s = Rf >> c(24)
+  q = s.eq(c(0)).where(Rf, s.eq(c(1)).where(((Rf + c(2)) >> c(2)) << c(2), ((Rf + c(8)) >> c(4)) << c(4)))
+  u = (c(2) * (q - (s << c(24)))).cast(_F64) * _c(2.0 ** -24, _F64) - _c(1.0, _F64)
+  f = _sc_coef(s, 0)
+  for k in range(1, 6): f = f * u + _sc_coef(s, k)
+  near = s.eq(c(0)).where(Rf, c(1 << 30) - Rf).cast(_F64) * _c(2.0 ** -31, _F64)
+  f = (s.eq(c(0)) | s.eq(c(63))).where(f * near, f)
+  m = f.cast(dtypes.float32).bitcast(dtypes.int32).cast(i64)
+  j = functools.reduce(lambda acc, b: acc + (Rh >= c(1 << (23 + b))).cast(i64), range(1, 7), c(0))
+  idx = (Rh < c(1 << 24)).where(Rh, c(1 << 24) + (j - c(1)) * c(1 << 23) + ((Rh >> j) - c(1 << 23)))
+  code = _tab_code2("sc_cos" if cos else "sc_sin", idx.cast(dtypes.uint32)).cast(i64)
+  key = idx + c(_SC_NA if cos else 0)
+  pos = c(0)
+  for step in (64, 32, 16, 8, 4, 2, 1): pos = (_tab_word("sc_esck", pos + c(step - 1)).cast(i64) <= key).where(pos + c(step), pos)
+  esc = _tab_word("sc_escv", (pos - c(1)).maximum(c(0))).bitcast(dtypes.int32).cast(i64)
+  v = m + code.eq(c(2)).where(esc, code)
+  v = neg.ne(negh).where(v ^ c(0x80000000), v)
+  return (v & c(0x7FFFFFFF)).eq(c(0)).where(c(0), v & c(0xFFFFFFFF)).cast(dtypes.uint32)
 def _hw_sin32(a:UOp, cos:bool) -> UOp:
-  # gfx1200 v_sin/v_cos f32 (revolutions). exact: |x| < 1.5*2^-12 (sin) is |x| * 0xC90FD5 * 2^-21 rounded half up; the rest reduces
-  # frac(x) to a 2^-31 grid (truncated), cos adding 1/4 there. the core (d * P(r), 64 cubic segments over a half period) is approximated
-  # here by the correctly rounded sin of the reduced argument
-  x = _as(a, dtypes.float32)
-  xd, u64 = x.cast(_F64), dtypes.uint64
-  X = _pcode._floor((xd - _pcode._floor(xd)) * _c(2.0 ** 31, _F64))
-  if cos: X = (X + _c(2.0 ** 29, _F64)) - _pcode._floor((X + _c(2.0 ** 29, _F64)) / _c(2.0 ** 31, _F64)) * _c(2.0 ** 31, _F64)
-  turns = X / _c(2.0 ** 31, _F64)
-  turns = turns - _pcode._floor(turns + _c(0.5, _F64))
-  core = UOp(Ops.SIN, src=(turns * _c(6.283185307179586, _F64),)).cast(dtypes.float32)
-  core = (xd.abs() < _c(float('inf'), _F64)).where(core, (xd - xd).cast(dtypes.float32))  # inf / NaN -> NaN
-  if cos: return core
-  prod = (xd.abs() * _c(0xC90FD5 / 2.0 ** 21, _F64)).bitcast(u64)  # exact 48-bit product
-  tiny = ((prod + _c(1 << 28, u64)) & _c(~((1 << 29) - 1) & 0xFFFFFFFFFFFFFFFF, u64)).bitcast(_F64).cast(dtypes.float32)
-  small = (xd.abs() < _c(1.5 * 2.0 ** -12, _F64)) & (xd.abs() >= _c(2.0 ** -126, _F64))
-  return small.where((x < _c(0.0, dtypes.float32)).where(-tiny, tiny), core)
+  # gfx1200 v_sin/v_cos f32 (revolutions), exact on every |x| < 2 and the large-|x| edge probes: sin = sign(x) * core(R0),
+  # cos = core'(R0), R0 = trunc(frac|x| * 2^31), an exact zero is +0; sin with |x| < 1.5*2^-12 (denormals, +-0 too) is
+  # |x| * 0xC90FD5 * 2^-21 rounded to nearest even onto the f32 grid, sign kept; inf -> negative default NaN, NaN -> quieted
+  i64, u32 = dtypes.int64, dtypes.uint32
+  def c(v): return _c(v, i64)
+  xb = _as(a, dtypes.float32).bitcast(u32).cast(i64)
+  sign, ex, man = xb >> c(31), (xb >> c(23)) & c(255), xb & c(0x7FFFFF)
+  mi = ex.eq(c(0)).where(man, man | c(1 << 23))
+  e2 = ex.eq(c(0)).where(c(-149), ex - c(150))
+  sh = e2 + c(31)
+  R0 = (sh >= c(0)).where(mi << sh.maximum(c(0)).minimum(c(40)), mi >> (c(0) - sh).maximum(c(0)).minimum(c(63)))
+  R0 = (sh >= c(32)).where(c(0), R0) & c((1 << 31) - 1)
+  out = _sc_core(R0, cos).cast(i64)
+  if not cos:
+    out = (sign.eq(c(1)) & out.ne(c(0))).where(out ^ c(0x80000000), out)
+    tiny = (ex < c(115)) | (ex.eq(c(115)) & (man < c(1 << 22)))
+    p = mi * c(0xC90FD5)
+    k = e2 - c(21)
+    nb = ((p.maximum(c(1)).cast(_F64).bitcast(dtypes.uint64) >> _c(52, dtypes.uint64)).cast(i64) & c(0x7FF)) - c(1022)
+    L = (nb - c(1) + k - c(23)).maximum(c(-149))
+    shv = L - k
+    sp = shv.maximum(c(0))
+    q0 = p >> sp
+    rem = p - (q0 << sp)
+    half = (shv > c(0)).where(c(1) << (shv - c(1)).maximum(c(0)), c(0))
+    up = (rem > half) | (rem.eq(half) & (q0 & c(1)).eq(c(1)))
+    q = (shv > c(0)).where(q0 + up.cast(i64), p << (c(0) - shv).maximum(c(0)).minimum(c(40)))
+    tb = (q.cast(_F64) * ((L + c(1023)) << c(52)).bitcast(_F64)).cast(dtypes.float32).bitcast(u32).cast(i64)
+    out = tiny.where(sign.eq(c(1)).where(tb | c(0x80000000), tb), out)
+  out = ex.eq(c(255)).where(man.ne(c(0)).where(xb | c(0x400000), c(0xFFC00000)), out)
+  return out.cast(u32).bitcast(dtypes.float32)
 _FUNCS.update(hw_sin32=lambda a: _hw_sin32(a, False), hw_cos32=lambda a: _hw_sin32(a, True))
 
 def _exp_of(x:UOp, emin:int) -> UOp:  # unbiased exponent of a finite f32-held value, zero -> -4000, denormals of the source type -> emin
@@ -1385,8 +1443,116 @@ def _hw_qsad(a:UOp, b:UOp, c:UOp, clmp:UOp, masked:bool) -> UOp:
     out = out | ((acc & _c(0xFFFF, u64)) << _c(16 * j, u64))
   return out
 _FUNCS['hw_amdnan64'] = lambda r, a: _amd_nan(_as(r, _F64), [_as(a, _F64)])  # an invalid op's NaN is the host's otherwise (arm +, x86 -)
-_HW_PCODE.update({'V_SQRT_F64': 'D0.f64 = hw_amdnan64(sqrt(S0.f64), S0.f64)', 'V_RSQ_F64': 'D0.f64 = hw_amdnan64(1.0 / sqrt(S0.f64), S0.f64)',
-                  'V_RCP_F64': 'D0.f64 = hw_amdnan64(1.0 / S0.f64, S0.f64)'})
+_F64C = {"rcp": dict(rb=24, ts=0, nR=32, sh=18, unit=64, neg=True), "rsq": dict(rb=24, ts=0, nR=32, sh=17, unit=128, neg=True),
+        "sqrt": dict(rb=25, ts=1, nR=16, sh=17, unit=128, neg=False)}
+def _i64(v): return _c(v, dtypes.int64)
+def _tab_i64(name:str, i:UOp) -> UOp:
+  return (_tab_word(name, i * _i64(2)).cast(dtypes.uint64) | (_tab_word(name, i * _i64(2) + _i64(1)).cast(dtypes.uint64) << _c(32, dtypes.uint64))).bitcast(dtypes.int64)
+def _tab_i32(name:str, i:UOp) -> UOp: return _tab_word(name, i).bitcast(dtypes.int32).cast(dtypes.int64)
+def _fshr(x:UOp, k) -> UOp:  # floor(x / 2^k) on signed int64 using only shifts of non-negative values
+  k = k if isinstance(k, UOp) else _i64(k)
+  return (x >= _i64(0)).where(x >> k, _i64(0) - ((_i64(0) - x + (_i64(1) << k) - _i64(1)) >> k))
+def _rne_pos(x:UOp, s) -> UOp:  # x >= 0 rounded to nearest even at bit s (s >= 0), returned >> s
+  s = s if isinstance(s, UOp) else _i64(s)
+  q = x >> s
+  r, h = x - (q << s), (s > _i64(0)).where(_i64(1) << (s - _i64(1)).maximum(_i64(0)), _i64(0))
+  return q + ((s > _i64(0)) & ((r > h) | (r.eq(h) & (q & _i64(1)).eq(_i64(1))))).cast(dtypes.int64)
+def _rne_s(x:UOp, s) -> UOp:
+  n = x < _i64(0)
+  v = _rne_pos(n.where(_i64(0) - x, x), s)
+  return n.where(_i64(0) - v, v)
+def _bitlen64(x:UOp) -> UOp:  # x >= 0, exact
+  n = _i64(0)
+  for b in (32, 16, 8, 4, 2, 1): n = (x >> (n + _i64(b))).ne(_i64(0)).where(n + _i64(b), n)
+  return x.eq(_i64(0)).where(_i64(0), n + _i64(1))
+def _tab_find(name_k:str, name_v:str, n:int, key:UOp, wide:bool) -> tuple[UOp, UOp]:  # sorted pow2-padded int64 keys
+  pos, step = _i64(0), n // 2
+  while step:
+    pos = (_tab_i64(name_k, pos + _i64(step - 1)) <= key).where(pos + _i64(step), pos)
+    step //= 2
+  pos = (_tab_i64(name_k, pos + _i64(n - 1)) <= key).where(_i64(n), pos) if n == 1 else pos
+  i = (pos - _i64(1)).maximum(_i64(0))
+  found = (pos > _i64(0)) & _tab_i64(name_k, i).eq(key)
+  return found, (_tab_i64(name_v, i) if wide else _tab_i32(name_v, i))
+def _f64_core(op:str, m29:UOp, pidx:UOp) -> UOp:
+  sp, i64 = _F64C[op], dtypes.int64
+  ng = 1 << 20
+  R, t = m29 >> _i64(sp["rb"]), m29 & _i64((1 << sp["rb"]) - 1)
+  tp = t >> _i64(sp["ts"])
+  u = tp >> _i64(4)
+  ri = pidx * _i64(sp["nR"]) + R
+  g = {k: _tab_i64(f"f_{op}_{k}", ri) for k in ("S2", "Z", "R0", "E", "C0", "K", "C1", "C2", "C3")}
+  P = g["S2"] * tp
+  r = (P >= (_i64(1) << (g["R0"] + _i64(24)))).where(g["R0"] + _i64(1), g["R0"])
+  nr, k = _rne_pos(P, r), (g["Z"] - r).maximum(_i64(0))
+  lam = (_i64(0) - ((nr + (_i64(1) << k) - _i64(1)) >> k)) if sp["neg"] else nr >> k
+  q = u >> _i64(3)
+  Q2 = ((q * q) >> _i64(10)) << _i64(10)
+  Mq = _rne_s(g["C2"] - g["C3"] * u, 19)
+  PP = Q2 * Mq
+  an = PP < _i64(0)
+  aa = an.where(_i64(0) - PP, PP)
+  shv = (_bitlen64(aa) - _i64(24)).maximum(_i64(33))
+  rm = _rne_pos(aa, shv) << shv
+  A = g["C0"] + _fshr(g["C1"] * u, 20) + _fshr(g["K"] + an.where(_i64(0) - rm, rm), 33)
+  nck = _hw_table_len(f"f_{op}_ck") // 8
+  found, cv = _tab_find(f"f_{op}_ck", f"f_{op}_cv", nck, (pidx << _i64(40)) + R * _i64(ng) + u, False)
+  A = found.where(A + cv, A)
+  if op == "rsq":
+    b = tp >> _i64(6)
+    qb = b >> _i64(3)
+    Ad = g["C0"] + _fshr(g["C1"] * b, 20) + _fshr(qb * qb * _fshr(g["C2"] - g["C3"] * b, 19), 33)
+    Ad = Ad + _tab_i32("f_rsq_dense", pidx * _i64(ng // 4) + b) + _tab_i32("f_rsq_dA", pidx * _i64(ng) + u)
+    pat = _tab_i32("f_rsq_pat", pidx * _i64(1024) + _tab_i32("f_rsq_pidx", pidx * _i64(ng // 4) + b) * _i64(64) + (tp & _i64(63)))
+    dense = R.eq(_i64(31))
+    A, lam = dense.where(Ad, A), dense.where(pat, lam)
+  V = A + _i64(sp["unit"]) * lam
+  out = (g["E"].cast(dtypes.uint64) << _c(52, dtypes.uint64)) | ((V.cast(dtypes.uint64) << _c(sp["sh"], dtypes.uint64)) & _c((1 << 52) - 1, dtypes.uint64))
+  nei = _hw_table_len(f"f_{op}_ei") // 8
+  if nei:
+    found, eh = _tab_find(f"f_{op}_ei", f"f_{op}_eh", nei, (pidx << _i64(40)) + m29, True)
+    out = found.where(eh.bitcast(dtypes.uint64), out)
+  return out
+def _hw_f64op(a:UOp, op:str) -> UOp:
+  i64, u64 = dtypes.int64, dtypes.uint64
+  M52 = (1 << 52) - 1
+  xb = _as(a, _F64).bitcast(u64)
+  s = (xb >> _c(63, u64)).cast(i64)
+  e = ((xb >> _c(52, u64)) & _c(0x7FF, u64)).cast(i64)
+  m = (xb & _c(M52, u64)).cast(i64)
+  den = e.eq(_i64(0)) & m.ne(_i64(0))
+  lz = den.where(_i64(53) - _bitlen64(m), _i64(0))
+  mn = den.where((m << lz) & _i64(M52), m)
+  ee = den.where(_i64(1) - lz, e)
+  m29, low = mn >> _i64(23), mn & _i64((1 << 23) - 1)
+  par = ee & _i64(1)
+  if op == "rcp": core, ce = _f64_core(op, m29, _i64(0)), _i64(1023)
+  else: core, ce = _f64_core(op, m29, _i64(1) - par), par.eq(_i64(1)).where(_i64(1023), _i64(1024))
+  E = (core >> _c(52, u64)).cast(i64) & _i64(0x7FF)
+  cm = (core & _c(M52, u64)).cast(i64)
+  if op != "sqrt":
+    dec = m29.eq(_i64(0)) & low.ne(_i64(0))
+    if op == "rsq": dec = dec & par.eq(_i64(1))
+    E, cm = dec.where(E - _i64(1), E), dec.where(_i64(M52), cm)
+  up = mn.eq(_i64(M52)) if op == "rcp" else None
+  if up is not None: cm = up.where(_i64(1), cm)
+  de = (ce - ee) if op == "rcp" else _fshr((ee - ce) if op == "sqrt" else (ce - ee), 1)
+  pe = E + de
+  full = cm | _i64(1 << 52)
+  k = (_i64(1) - pe).maximum(_i64(0)).minimum(_i64(63))
+  dn = full >> k
+  if up is not None: dn = dn + (up & (full & ((_i64(1) << k) - _i64(1))).ne(_i64(0))).cast(i64)
+  out = (pe >= _i64(2047)).where(_i64(0x7FF << 52), (pe <= _i64(0)).where(dn, (pe.maximum(_i64(0)).minimum(_i64(2046)) << _i64(52)) | cm)).cast(u64)
+  S = s.cast(u64) << _c(63, u64)
+  if op == "rcp": out = out | S
+  zero, inf, nan = e.eq(_i64(0)) & m.eq(_i64(0)), e.eq(_i64(2047)) & m.eq(_i64(0)), e.eq(_i64(2047)) & m.ne(_i64(0))
+  INF, DN, Z0 = _c(0x7FF0000000000000, u64), _c(0xFFF8000000000000, u64), _c(0, u64)
+  if op == "rcp": out = zero.where(S | INF, inf.where(S, out))
+  elif op == "rsq": out = zero.where(S | INF, (inf & s.eq(_i64(0))).where(Z0, s.eq(_i64(1)).where(DN, out)))
+  else: out = zero.where(S, (inf & s.eq(_i64(0))).where(INF, s.eq(_i64(1)).where(DN, out)))
+  return nan.where(xb | _c(1 << 51, u64), out).bitcast(_F64)
+_FUNCS.update(hw_rcp64=lambda a: _hw_f64op(a, "rcp"), hw_rsq64=lambda a: _hw_f64op(a, "rsq"), hw_sqrt64=lambda a: _hw_f64op(a, "sqrt"))
+_HW_PCODE.update({'V_SQRT_F64': 'D0.f64 = hw_sqrt64(S0.f64)', 'V_RSQ_F64': 'D0.f64 = hw_rsq64(S0.f64)', 'V_RCP_F64': 'D0.f64 = hw_rcp64(S0.f64)'})
 _FUNCS['hw_trig_preop'] = lambda sh: _pcode._trig_preop(sh, low=18)  # gfx1200 keeps 2/pi down to bit 18 of the 1201
 _FUNCS['hw_mqsad'] = lambda a, b, c, clmp: _hw_qsad(a, b, c, clmp, True)
 _FUNCS['hw_qsad'] = lambda a, b, c, clmp: _hw_qsad(a, b, c, clmp, False)
@@ -1502,7 +1668,7 @@ def _emu_digest() -> str:
   import tinygrad
   h = hashlib.sha256()
   here = pathlib.Path(__file__).parent
-  for f in sorted([*pathlib.Path(tinygrad.__file__).parent.rglob("*.py"), *here.glob("*.py"), *here.glob("*.sigs")]):
+  for f in sorted([*pathlib.Path(tinygrad.__file__).parent.rglob("*.py"), *here.glob("*.py"), *here.glob("*.sigs"), *here.glob("gfx1200_*.npz")]):
     h.update(str(f.relative_to(f.parents[1])).encode() + b"\0" + f.read_bytes() + b"\0")
   try:
     from tinygrad.runtime.autogen import llvm

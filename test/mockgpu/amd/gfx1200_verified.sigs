@@ -2149,6 +2149,21 @@ v_cos_f16_e64|omod=3|abs=1
 v_cos_f16_e64|omod=3|neg=1|opsel=1
 v_cos_f16_e64|opsel=1
 v_cos_f16_e64|opsel=8
+v_cos_f32_e32
+v_cos_f32_e64
+v_cos_f32_e64|abs=1
+v_cos_f32_e64|clmp=1
+v_cos_f32_e64|clmp=1|abs=1
+v_cos_f32_e64|clmp=1|abs=1|neg=1
+v_cos_f32_e64|clmp=1|omod=1|abs=1
+v_cos_f32_e64|clmp=1|omod=2|abs=1|neg=1
+v_cos_f32_e64|clmp=1|omod=3|abs=1
+v_cos_f32_e64|neg=1
+v_cos_f32_e64|omod=1
+v_cos_f32_e64|omod=2
+v_cos_f32_e64|omod=2|abs=1|neg=1
+v_cos_f32_e64|omod=3
+v_cos_f32_e64|omod=3|neg=1
 v_cubeid_f32
 v_cubeid_f32|abs=1
 v_cubeid_f32|abs=2
@@ -5622,7 +5637,21 @@ v_rcp_f32_e64|omod=1
 v_rcp_f32_e64|omod=2
 v_rcp_f32_e64|omod=2|neg=1
 v_rcp_f32_e64|omod=3
+v_rcp_f64_e32
+v_rcp_f64_e64
+v_rcp_f64_e64|abs=1
+v_rcp_f64_e64|clmp=1
+v_rcp_f64_e64|clmp=1|neg=1
+v_rcp_f64_e64|clmp=1|omod=1
 v_rcp_f64_e64|clmp=1|omod=1|abs=1|neg=1
+v_rcp_f64_e64|clmp=1|omod=2
+v_rcp_f64_e64|clmp=1|omod=3|abs=1
+v_rcp_f64_e64|neg=1
+v_rcp_f64_e64|omod=1
+v_rcp_f64_e64|omod=1|abs=1
+v_rcp_f64_e64|omod=2
+v_rcp_f64_e64|omod=2|abs=1
+v_rcp_f64_e64|omod=3
 v_rcp_iflag_f32_e32
 v_rcp_iflag_f32_e64
 v_rcp_iflag_f32_e64|abs=1
@@ -5729,8 +5758,21 @@ v_rsq_f32_e64|omod=1|neg=1
 v_rsq_f32_e64|omod=2
 v_rsq_f32_e64|omod=3
 v_rsq_f32_e64|omod=3|abs=1
+v_rsq_f64_e32
+v_rsq_f64_e64
+v_rsq_f64_e64|abs=1
+v_rsq_f64_e64|clmp=1
+v_rsq_f64_e64|clmp=1|omod=1|neg=1
+v_rsq_f64_e64|clmp=1|omod=2|abs=1
+v_rsq_f64_e64|clmp=1|omod=2|neg=1
 v_rsq_f64_e64|clmp=1|omod=3|abs=1|neg=1
+v_rsq_f64_e64|neg=1
+v_rsq_f64_e64|omod=1
+v_rsq_f64_e64|omod=1|neg=1
+v_rsq_f64_e64|omod=2
+v_rsq_f64_e64|omod=2|abs=1
 v_rsq_f64_e64|omod=2|abs=1|neg=1
+v_rsq_f64_e64|omod=3
 v_s_exp_f16
 v_s_exp_f16|abs=1
 v_s_exp_f16|clmp=1
@@ -5932,6 +5974,21 @@ v_sin_f16_e64|omod=3
 v_sin_f16_e64|omod=3|opsel=8
 v_sin_f16_e64|opsel=1
 v_sin_f16_e64|opsel=8
+v_sin_f32_e32
+v_sin_f32_e64
+v_sin_f32_e64|abs=1
+v_sin_f32_e64|clmp=1
+v_sin_f32_e64|clmp=1|abs=1|neg=1
+v_sin_f32_e64|clmp=1|omod=1
+v_sin_f32_e64|clmp=1|omod=1|abs=1|neg=1
+v_sin_f32_e64|clmp=1|omod=2|abs=1|neg=1
+v_sin_f32_e64|clmp=1|omod=3|abs=1|neg=1
+v_sin_f32_e64|neg=1
+v_sin_f32_e64|omod=1
+v_sin_f32_e64|omod=2
+v_sin_f32_e64|omod=2|abs=1|neg=1
+v_sin_f32_e64|omod=3
+v_sin_f32_e64|omod=3|abs=1|neg=1
 v_sqrt_f16_e32
 v_sqrt_f16_e64
 v_sqrt_f16_e64|abs=1
@@ -5970,8 +6027,22 @@ v_sqrt_f32_e64|omod=2|neg=1
 v_sqrt_f32_e64|omod=3
 v_sqrt_f32_e64|omod=3|abs=1
 v_sqrt_f32_e64|omod=3|abs=1|neg=1
+v_sqrt_f64_e32
+v_sqrt_f64_e64
+v_sqrt_f64_e64|abs=1
+v_sqrt_f64_e64|clmp=1
 v_sqrt_f64_e64|clmp=1|abs=1|neg=1
+v_sqrt_f64_e64|clmp=1|neg=1
+v_sqrt_f64_e64|clmp=1|omod=1|abs=1
 v_sqrt_f64_e64|clmp=1|omod=3|abs=1|neg=1
+v_sqrt_f64_e64|clmp=1|omod=3|neg=1
+v_sqrt_f64_e64|neg=1
+v_sqrt_f64_e64|omod=1
+v_sqrt_f64_e64|omod=1|abs=1
+v_sqrt_f64_e64|omod=2
+v_sqrt_f64_e64|omod=2|neg=1
+v_sqrt_f64_e64|omod=3
+v_sqrt_f64_e64|omod=3|abs=1
 v_sqrt_f64_e64|omod=3|abs=1|neg=1
 v_sub_f16_e32
 v_sub_f16_e64
@@ -6253,6 +6324,7 @@ fields v_cmpx_u_f16_e64
 fields v_cmpx_u_f32_e64
 fields v_cmpx_u_f64_e64
 fields v_cos_f16_e64
+fields v_cos_f32_e64
 fields v_cubeid_f32
 fields v_cubema_f32
 fields v_cubesc_f32
@@ -6412,12 +6484,14 @@ fields v_pk_sub_u16|opsel_hi=3|opsel_hi2=1
 fields v_qsad_pk_u16_u8
 fields v_rcp_f16_e64
 fields v_rcp_f32_e64
+fields v_rcp_f64_e64
 fields v_rcp_iflag_f32_e64
 fields v_rndne_f16_e64
 fields v_rndne_f32_e64
 fields v_rndne_f64_e64
 fields v_rsq_f16_e64
 fields v_rsq_f32_e64
+fields v_rsq_f64_e64
 fields v_s_exp_f16
 fields v_s_exp_f32
 fields v_s_log_f16
@@ -6430,8 +6504,10 @@ fields v_s_sqrt_f16
 fields v_s_sqrt_f32
 fields v_sat_pk_u8_i16_e64
 fields v_sin_f16_e64
+fields v_sin_f32_e64
 fields v_sqrt_f16_e64
 fields v_sqrt_f32_e64
+fields v_sqrt_f64_e64
 fields v_sub_f16_e64
 fields v_sub_f32_e64
 fields v_subrev_f16_e64
