@@ -1,7 +1,17 @@
 import ctypes, functools, mmap
 from tinygrad.runtime.autogen import kgsl, libc
 from test.mockgpu.driver import VirtDriver, VirtFileDesc, VirtFile
-from test.mockgpu.qcom.qcomgpu import QCOMGPU
+from test.mockgpu.qcom.qcomgpu import QCOMGPU, METAL
+if METAL:  # gpu objects live in one Metal buffer, so a630 addresses are offsets into it
+  from test.mockgpu.qcom import metal
+  from tinygrad.runtime.support import system
+  _munmap = system.FileIOInterface.munmap
+  def _arena_munmap(buf, sz):
+    if not metal.runtime().owns(buf): return _munmap(buf, sz)
+    metal.runtime().sync()
+    metal.runtime().release(buf)
+    return 0
+  system.FileIOInterface.munmap = staticmethod(_arena_munmap)
 
 def _ioctl_nr(ioctl:functools.partial) -> int: return ioctl.args[2]
 WAIT_IOCTLS = {_ioctl_nr(kgsl.IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID), _ioctl_nr(kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID)}
@@ -15,7 +25,7 @@ class KGSLFileDesc(VirtFileDesc):
 
   def ioctl(self, fd, request, argp): return self.driver.kgsl_ioctl(request, argp)
   def mmap(self, start, sz, prot, flags, fd, offset):
-    addr = libc.mmap(start, sz, prot, flags|mmap.MAP_ANONYMOUS, -1, 0)
+    addr = metal.runtime().alloc(sz) if METAL else libc.mmap(start, sz, prot, flags|mmap.MAP_ANONYMOUS, -1, 0)
     self.driver.mappings[("obj", offset // 0x1000)] = (addr, sz)
     return addr
 

@@ -1,8 +1,10 @@
 import time
 import numpy as np
-from tinygrad.helpers import to_mv
+from tinygrad.helpers import to_mv, getenv
 from tinygrad.runtime.autogen import mesa
 from test.mockgpu.qcom import emu
+METAL = getenv("QCOM_METAL")
+if METAL: from test.mockgpu.qcom import metal
 
 def field(val:int, name:str) -> int: return (val & getattr(mesa, f"{name}__MASK")) >> getattr(mesa, f"{name}__SHIFT")
 def u64(lo:int, hi:int) -> int: return lo | (hi << 32)
@@ -50,8 +52,13 @@ class QCOMGPU:
         del words[:1 + cnt]
       self.pending.pop(0)
       self.draining = max(0, self.draining - 1)
+    if METAL: metal.runtime().sync()
 
   def _exec_pkt7(self, op:int, d:list[int]) -> bool: # False when the CP has to wait
+    if METAL and op == mesa.CP_EVENT_WRITE and d[0] & 0xFF == mesa.CACHE_FLUSH_TS:
+      metal.runtime().deferred.append((u64(d[1], d[2]), d[3]))
+      return True
+    if METAL and op in (mesa.CP_WAIT_REG_MEM, mesa.CP_REG_TO_MEM): metal.runtime().sync()
     if op in (mesa.CP_SET_MARKER, mesa.CP_WAIT_FOR_IDLE, mesa.CP_WAIT_MEM_WRITES): return True
     if op == mesa.CP_EVENT_WRITE:
       if d[0] & 0xFF == mesa.CACHE_FLUSH_TS: to_mv(u64(d[1], d[2]), 4).cast("I")[0] = d[3]
@@ -118,7 +125,7 @@ class QCOMGPU:
     ntex, nuav = (field(self.regs[mesa.REG_A6XX_SP_CS_CONFIG], f"A6XX_SP_CS_CONFIG_{f}") for f in ("NTEX", "NUAV"))
     textures = self._images(self._reg64(mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE), ntex, tex=True) if ntex else []
     ibos = self._images(self._reg64(mesa.REG_A6XX_SP_CS_UAV_BASE), nuav, tex=False) if nuav else []
-    emu.run(emu.Dispatch(self.shader, self.consts, local, tuple(groups), field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID"),
+    (metal.run if METAL else emu.run)(emu.Dispatch(self.shader, self.consts, local, tuple(groups), field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_LOCALIDREGID"),
                          field(cfg, "A6XX_SP_CS_CONST_CONFIG_0_WGIDCONSTID"), lmem_size, pvt_size, list(self.mappings.values()),
                          textures, ibos, demote, self.samplers, self.regs[mesa.REG_A6XX_SP_CS_PROGRAM_COUNTER_OFFSET],
                          bool(self.regs[mesa.REG_A6XX_SP_CS_CNTL_0] & mesa.A6XX_SP_CS_CNTL_0_MERGEDREGS)))
