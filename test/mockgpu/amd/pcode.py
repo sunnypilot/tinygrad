@@ -318,7 +318,26 @@ TWO_OVER_PI = int(
   "da3eda6cfd9e4f96136e9e8c7ecd3cbfd45aea4f758fd7cbe2f67a0e73ef14a525d4d7f6bf623f1aba10ac06608df8f6", 16)
 # TWO_OVER_PI as 19 u64 words for trig_preop_result (word[0] = bits 0-63, word[18] = bits 1152-1200)
 _PREOP_WORDS = tuple((TWO_OVER_PI >> (64 * i)) & 0xFFFFFFFFFFFFFFFF for i in range(19))
-def _trig_preop(val: UOp) -> UOp:
+def _fma(a, b, c):
+  if isinstance(a, UOp) and dtypes.is_float(a.dtype):
+    b, c = (x if isinstance(x, UOp) and x.dtype == a.dtype else (x.cast(a.dtype) if isinstance(x, UOp) else a.const_like(x)) for x in (b, c))
+    return _fma16(a, b, c) if a.dtype == dtypes.half else a.alu(Ops.MULACC, b, c)
+  return a * b + c
+
+def _fma16(a, b, c):
+  f64, u64 = dtypes.float64, dtypes.uint64
+  p, cc = a.cast(f64) * b.cast(f64), c.cast(f64)
+  s = p + cc
+  bb = s - p
+  err = (p - (s - bb)) + (cc - bb)
+  sb = s.bitcast(u64)
+  odd = err.ne(err.const_like(0.0)) & s.eq(s) & (s.abs() < s.const_like(float('inf')))
+  away = (err < err.const_like(0.0)).ne(s < s.const_like(0.0)) & s.ne(s.const_like(0.0))
+  sb = (odd & away).where(sb - sb.const_like(1), sb)
+  r = odd.where(sb | sb.const_like(1), sb).bitcast(f64).cast(dtypes.half)
+  return (p.ne(p) | cc.ne(cc)).where(a.alu(Ops.MULACC, b, c), r)
+
+def _trig_preop(val: UOp, low: int = 0) -> UOp:
   # Extract 53 bits from position (1148 - shift) in the 1201-bit 2/PI constant
   # Using word-based selection: 19 conditions instead of 1149
   shift = val.cast(dtypes.uint32)
@@ -326,14 +345,18 @@ def _trig_preop(val: UOp) -> UOp:
   word_idx = bit_pos >> _u32(6)  # // 64
   bit_off = bit_pos & _u32(63)   # % 64
   # Select lo_word and hi_word using shared conditions
-  lo_word, hi_word = _u64(_PREOP_WORDS[18]), _u64(0)
+  words = [_PREOP_WORDS[0] & ~((1 << low) - 1) & 0xFFFFFFFFFFFFFFFF, *_PREOP_WORDS[1:]]
+  lo_word, hi_word = _u64(words[18]), _u64(0)
   for i in range(17, -1, -1):
     cond = word_idx.eq(_u32(i))
-    lo_word = cond.where(_u64(_PREOP_WORDS[i]), lo_word)
-    hi_word = cond.where(_u64(_PREOP_WORDS[i + 1]), hi_word)
+    lo_word = cond.where(_u64(words[i]), lo_word)
+    hi_word = cond.where(_u64(words[i + 1]), hi_word)
   # Combine and extract 53 bits: ((lo >> bit_off) | (hi << (64 - bit_off))) & mask
   bit_off_64 = bit_off.cast(dtypes.uint64)
   result = ((lo_word >> bit_off_64) | (hi_word << (_u64(64) - bit_off_64))) & _u64(0x1fffffffffffff)
+  past = shift > _u32(1148)  # the window runs off b_0: zeros come in below it
+  tail = _u64(words[0]) << past.where(shift - _u32(1148), _u32(0)).cast(dtypes.uint64)
+  result = past.where((shift < _u32(1201)).where(tail & _u64(0x1fffffffffffff), _u64(0)), result)
   return result.cast(dtypes.float64)
 
 def _ff1(val: UOp, bits: int) -> UOp:
@@ -356,6 +379,8 @@ def _sad_u8(a: UOp, b: UOp, acc: UOp, masked: bool = False) -> UOp:
     result = result + (a_byte.ne(_u32(0)).where(diff, _u32(0)) if masked else diff)
   return result
 
+_float_binop_hook: Callable = lambda left, right, op, res: res
+
 _FUNCS: dict[str, Callable[..., UOp]] = {
   'sqrt': lambda a: UOp(Ops.SQRT, src=(a,)), 'trunc': lambda a: UOp(Ops.TRUNC, src=(a,)),
   'log2': lambda a: UOp(Ops.LOG2, src=(a,)), 'sin': lambda a: _trig_reduce(a),
@@ -364,8 +389,9 @@ _FUNCS: dict[str, Callable[..., UOp]] = {
   'isEven': lambda a: (UOp(Ops.TRUNC, src=(a,)).cast(dtypes.int) & _const(dtypes.int, 1)).eq(_const(dtypes.int, 0)),
   'max': lambda a, b: UOp(Ops.MAX, src=(a, b)),
   'min': lambda a, b: UOp(Ops.MAX, src=(a.neg(), b.neg())).neg(),
-  'pow': lambda a, b: UOp(Ops.EXP2, src=(b.bitcast(dtypes.float32),)),
-  'fma': lambda a, b, c: a * b + c,
+  # pow(2.0, x): interpret the operand's float bits at its original width.
+  'pow': lambda a, b: UOp(Ops.EXP2, src=(b.bitcast({2: dtypes.half, 4: dtypes.float32, 8: dtypes.float64}[b.dtype.itemsize]),)),
+  'fma': lambda a, b, c: _fma(a, b, c),
   'i32_to_f32': lambda a: a.cast(dtypes.int).cast(dtypes.float32),
   'u32_to_f32': lambda a: a.cast(dtypes.uint32).cast(dtypes.float32),
   'f32_to_i32': lambda a: _f_to_i32(a.bitcast(dtypes.float32)),
@@ -558,18 +584,20 @@ class Parser:
         return (left >> right) if op == '>>' else (left << right)
       case '+' | '-':
         if op == '-' and (lv:=_single_value(left)) is not None and (rv:=_single_value(right)) is not None: return _const(left.dtype, lv - rv)
-        return (left + right) if op == '+' else (left - right)
+        res = (left + right) if op == '+' else (left - right)
+        return _float_binop_hook(left, right, op, res) if dtypes.is_float(res.dtype) else res
       case '*' | '/':
         # Integer promotion: promote 16-bit integers to 32-bit before multiply to avoid overflow
         # (e.g. SOPP branch offset: SIMM16.i16 * 16'4 can exceed int16 range)
         if op == '*' and left.dtype.itemsize == 2 and left.dtype in (dtypes.int16, dtypes.short, dtypes.uint16, dtypes.ushort):
           pdt = dtypes.int if left.dtype in (dtypes.int16, dtypes.short) else dtypes.uint
           left, right = left.cast(pdt), right.cast(pdt)
-        if op == '*': return left * right
+        if op == '*': return _float_binop_hook(left, right, op, left * right) if dtypes.is_float(left.dtype) else left * right
         return (left // right) if dtypes.is_int(left.dtype) else (left / right)
       case '**': return UOp(Ops.EXP2, src=(right.cast(left.dtype),)) if _single_value(left) == 2.0 else left
+      case '%': return left % right
 
-  _PREC = [('||',), ('&&',), ('|',), ('^',), ('&',), ('==', '!=', '<>'), ('>=', '<=', '>', '<'), ('>>', '<<'), ('+', '-'), ('*', '/'), ('**',)]
+  _PREC = [('||',), ('&&',), ('|',), ('^',), ('&',), ('==', '!=', '<>'), ('>=', '<=', '>', '<'), ('>>', '<<'), ('+', '-'), ('*', '/', '%'), ('**',)]
 
   def binop(self, prec: int) -> UOp:
     if prec >= len(self._PREC): return self.unary()
@@ -1449,7 +1477,7 @@ def parse_pcode(pcode: str, srcs: dict[str, UOp | int] | None = None, funcs: dic
   _, final, _ = parse_block(lines, 0, env, {**_FUNCS, **funcs} if funcs else None, assigns=assigns)
   sliced = set(d.split('[')[0] for d, _ in assigns if '[' in d)
   for var, val in final.items():
-    if var in ['D0', 'S0', 'SCC', 'VCC', 'EXEC', 'PC', 'RETURN_DATA', 'VDATA'] and isinstance(val, UOp):
+    if var in ['D0', 'S0', 'SCC', 'VCC', 'EXEC', 'PC', 'RETURN_DATA', 'VDATA', 'SDATA'] and isinstance(val, UOp):
       if var in sliced and not any(re.match(rf'{var}\.\w+\s*=', l) for l in lines): continue
       for l in lines:
         if (m := re.match(rf'{var}\.(\w+(?:\[\w+\])?)', l)):
