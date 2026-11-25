@@ -327,6 +327,13 @@ jobs:
           python examples/openpilot/load_pickle.py --run /tmp/warp_driving.pkl --runs 3
           python examples/openpilot/compile_warp.py --output /tmp/warp_monitoring.pkl --benchmark-runs 1 --frame 1928,1208,2048,1216,608,4804608 --warp-to 1440x960 --layout luma --border-fill 16 --transform-device NPY
           python examples/openpilot/load_pickle.py --run /tmp/warp_monitoring.pkl --runs 3
+      - name: Test comma 3X -> comma 4 reprojection (DEV=CPU:LLVM)
+        env:
+          DEV: CPU:LLVM
+          FRAMES: --src 1928,1208,2048,1216,608,4804608 --dst 1344,760,1408,768,384,2428928
+        run: |
+          python examples/openpilot/compile_reproject_tables.py --output /tmp/reproject_tables.pkl --benchmark-runs 1 $FRAMES --zmin -0.0349 --feather 50 --alpha-shift 22 --invalid-bit 1073741824 --lenses '{"os_wide":{"f":447.502,"cx":672.0,"cy":380.0,"k":[-0.014942,-0.0023814,-0.00064424],"tc":1.548},"os_narrow":{"f":1156.5,"cx":672.0,"cy":380.0,"k1":-0.03},"ar_ox_wide":{"f":597.732,"cx":963.936,"cy":603.959,"k":[-0.011968,0.024043,-0.0091132],"tc":1.51354},"ar_ox_narrow":{"f":2600.85,"cx":964.0,"cy":604.0,"k1":-0.364}}'
+          python examples/openpilot/load_pickle.py --run /tmp/reproject_tables.pkl --runs 3
       - name: Test driving_supercombo (DEV=CL::IMAGE_PITCH_ALIGNMENT=64)
         env:
           # IMAGE_PITCH_ALIGNMENT=64 matches adreno 630
