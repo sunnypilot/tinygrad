@@ -67,6 +67,7 @@ class QCOMDriver(VirtDriver):
       for i in range(cmd.numcmds):
         obj = kgsl.struct_kgsl_command_object.from_address(cmd.cmdlist + i * cmd.cmdsize)
         self.gpu.submit(obj.gpuaddr, obj.size // 4)
+      self.gpu.progress()
       self.timestamp += 1
       cmd.timestamp = self.timestamp
     elif nr == _ioctl_nr(kgsl.IOCTL_KGSL_CMDSTREAM_READTIMESTAMP_CTXTID):
