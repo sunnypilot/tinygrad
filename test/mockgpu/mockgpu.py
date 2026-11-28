@@ -2,7 +2,8 @@ import ctypes, time, os, builtins, fcntl, typing
 from tinygrad.helpers import DEV, dedup, to_tuple, round_up
 from tinygrad.device import Compiled, Device
 from tinygrad.dtype import dtypes
-from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher, CustomFunction
+from tinygrad.uop.ops import UOp, UPat, Ops, PatternMatcher
+from tinygrad.runtime.support import elf
 from tinygrad.runtime.support.system import FileIOInterface, System
 from tinygrad.runtime.support.hcq2 import HWQueue
 from tinygrad.runtime.autogen import libc
@@ -32,16 +33,19 @@ def hook_doorbells(s:UOp) -> UOp|None:
   hooks = tuple(UOp.custom_function("mockgpu_doorbell").call(b.after(c).getaddr(Device[d].host)) for c in s.toposort() if c.op is Ops.CALL
                 for b in c.src[1:] if b.op is Ops.ALLOC and "doorbell" in str(b.arg.name) and (d:=to_tuple(b.device)[0]).split(":")[0] in mocked)
   return None if all(h in s.src for h in hooks) else s.replace(src=tuple(dedup(s.src + hooks)))
-def hook_ioctl(f:UOp) -> UOp|None:
-  return f.replace(arg=CustomFunction("mockgpu_ioctl", f.arg.dtype)) if f.arg.name == "ioctl" and "QCOM" in mocked else None
-Compiled.pm_lower += PatternMatcher([(UPat(Ops.SINK, name="s"), hook_doorbells), (UPat(Ops.CUSTOM_FUNCTION, name="f"), hook_ioctl)])
+Compiled.pm_lower += PatternMatcher([(UPat(Ops.SINK, name="s"), hook_doorbells)])
+
+# compiled submits call ioctl directly: link it to the mock when they load, so the program is the one a device builds
+_link_sym = elf.link_sym
+elf.link_sym = lambda sym, *args: ctypes.cast(mockgpu_ioctl, ctypes.c_void_p).value if sym == "ioctl" and "QCOM" in mocked else _link_sym(sym, *args)
 
 @ctypes.CFUNCTYPE(None, ctypes.c_uint64)
 def mockgpu_progress(_:int): # compiled spin loops wait on the gpus, which run only when called
   for d in drivers: d.progress()
 setattr(libc.dll, "mockgpu_progress", mockgpu_progress)
 
-def kick_gpus(body:UOp, loop:UOp, cond:UOp) -> UOp|None: # each iteration of a spin loop runs the gpus
+def kick_gpus(body:UOp, loop:UOp, cond:UOp) -> UOp|None: # each iteration of a spin loop runs the gpus, the qcom mock runs them on submit
+  if mocked <= {"QCOM"}: return None
   kick = UOp.custom_function("mockgpu_progress").call(UOp.const(0, dtypes.uint64).after(body))
   return None if kick in cond.src else body.backedge(loop, cond.after(kick))
 Compiled.pm_lower += PatternMatcher([(UPat(Ops.BACKEDGE, src=(UPat(name="body"), UPat(name="loop"), UPat(name="cond"))), kick_gpus)])
